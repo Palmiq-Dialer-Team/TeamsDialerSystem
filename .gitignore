@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+*.manifest
+*.spec
+
+# Virtual environments
+venv/
+.env/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Secrets - use .example files and set real values locally
+LiveKit/config.yaml
+Backend/.env
+
+# Local data - DO NOT upload real user data
+Dispositions/
+logs/
+*.log
+db_snapshots/
+Backend/db_snapshots/
+teams_dialer.db
+teams_dialer.db-wal
+teams_dialer.db-shm
+teams_dialer_backup.db
+Backend/teams_dialer.db
+Backend/teams_dialer.db-wal
+Backend/teams_dialer.db-shm
+user_settings.json
+session_history.json
+client_history.db
+local_version.json
+
+# Build artifacts
+client_package.zip
+tester_package.zip
+WebUpdates/backup/
+WebUpdates/client_package.zip
+WebUpdates/tester_package.zip
+
+# PyInstaller / build outputs
+Backend/build/
+Backend/dist/
+
+# Editor / tooling
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

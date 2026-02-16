@@ -1,0 +1,34 @@
+# TeamsPowerDialer - Consolidated dependencies
+# Installer (Client) + Backend (Server)
+
+# === Installer (Client) ===
+PyQt6>=6.6.0
+qdarktheme
+pandas>=2.0.0
+pywinauto>=0.6.8
+pyaudiowpatch
+websockets>=11.0
+openpyxl>=3.1.0
+numpy>=1.24.0
+pywin32>=306
+pygetwindow>=0.0.9
+resampy
+pydub
+pytz
+requests
+pyautogui
+uiautomation
+livekit
+
+# === Backend (Server) ===
+python-dotenv>=1.0.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+jinja2>=3.1.0
+msal
+scipy
+torch>=1.12.0
+torchaudio>=0.12.0
+silero-vad
+faster-whisper
+livekit-api

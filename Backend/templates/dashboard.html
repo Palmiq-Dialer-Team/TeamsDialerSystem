@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Command Center</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root { --bg: #1a1a1a; --card: #2d2d2d; --accent: #007bff; --text: #e0e0e0; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; display: flex; height: 100vh; }
+        
+        /* Sidebar for Exports */
+        .sidebar { width: 250px; background: #222; padding: 20px; border-right: 1px solid #333; display: flex; flex-direction: column; }
+        .sidebar h2 { font-size: 1.2rem; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+        .export-btn { 
+            background: #333; color: white; border: 1px solid #444; 
+            padding: 10px; margin-bottom: 8px; cursor: pointer; text-align: left; border-radius: 4px; transition: 0.2s;
+        }
+        .export-btn:hover { background: var(--accent); border-color: var(--accent); }
+        
+        /* Main Content */
+        .main { flex: 1; padding: 30px; overflow-y: auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        
+        /* Agent Grid */
+        .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }
+        
+        /* Agent Card Design */
+        .agent-card { 
+            background: var(--card); border-radius: 12px; padding: 20px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3); border: 1px solid #333;
+            transition: transform 0.2s; position: relative;
+        }
+        .agent-card:hover { transform: translateY(-2px); border-color: #555; }
+        
+        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .agent-name { font-size: 1.4rem; font-weight: 800; }
+        .status-badge { padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; }
+        .status-connected { background: rgba(46, 234, 144, 0.2); color: #2eea90; border: 1px solid #2eea90; }
+        .status-disconnected { background: rgba(255, 69, 58, 0.2); color: #ff453a; border: 1px solid #ff453a; }
+        
+        .live-info { background: #222; padding: 10px; border-radius: 6px; margin-bottom: 15px; }
+        .info-row { display: flex; justify-content: space-between; font-size: 0.9rem; margin-bottom: 5px; }
+        .label { color: #888; }
+        
+        .stats-row { display: flex; gap: 10px; margin-top: 15px; border-top: 1px solid #444; padding-top: 15px; }
+        .stat-box { flex: 1; text-align: center; }
+        .stat-num { display: block; font-size: 1.5rem; font-weight: 800; color: white; }
+        .stat-label { font-size: 0.75rem; color: #888; text-transform: uppercase; }
+        
+        .listen-btn { 
+            width: 100%; padding: 12px; margin-top: 15px; border: none; border-radius: 6px; 
+            background: var(--accent); color: white; font-weight: 600; cursor: pointer; 
+            position: relative; z-index: 10; pointer-events: auto;
+        }
+        .listen-btn.active { background: #2eea90; animation: pulse 1.5s infinite; }
+        .listen-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+    <!-- Sidebar for Exports -->
+    <div class="sidebar">
+        <h2>Data Export</h2>
+        <p style="font-size: 0.8rem; color: #666; margin-bottom: 15px;">Download consolidated lists from all agents.</p>
+        
+        <label style="font-size: 0.85rem; color: #aaa; margin-bottom: 8px; display: block;">Filter by Agent:</label>
+        <select id="agentExportFilter" style="width: 100%; padding: 8px; background: #333; color: white; border: 1px solid #444; border-radius: 4px; margin-bottom: 20px; font-size: 0.9rem;">
+            <option value="ALL">All Agents</option>
+        </select>
+        
+        <button class="export-btn" onclick="exportData('Booked Meeting')">💰 Export "Booked Meeting"</button>
+        <button class="export-btn" onclick="exportData('No Response')">📄 Export "No Response"</button>
+        <button class="export-btn" onclick="exportData('Sent Info')">📤 Export "Sent Info"</button>
+        <button class="export-btn" onclick="exportData('Not Interested')">📄 Export "Not Interested"</button>
+        <button class="export-btn" onclick="exportData('Call Back Later')">⏰ Export "Call Backs"</button>
+        <button class="export-btn" onclick="exportData('Wrong Number')">❌ Export "Wrong Number"</button>
+        <button class="export-btn" onclick="exportData('Voicemail (Verified)')">📞 Export "Voicemail (Verified)"</button>
+        <button class="export-btn" onclick="exportData('Invalid Contact')">⚠️ Export "Invalid Contact"</button>
+        <hr style="border-color: #333; width: 100%;">
+        <button class="export-btn" onclick="exportData('ALL')">📦 Export FULL Database</button>
+    </div>
+
+    <!-- Main Dashboard -->
+    <div class="main">
+        <div class="header">
+            <h1>📞 Live Operations Floor</h1>
+            <div id="connection-status" style="color: #888;">Connecting to server...</div>
+        </div>
+        
+        <div id="agents-grid" class="agent-grid">
+            <!-- Agent Cards injected here via JS -->
+        </div>
+    </div>
+
+    <script>
+        function getServerHost() {
+            // Trust the browser URL (e.g., 192.168.1.46:8080). 
+            // IIS handles the mapping to the internal server.
+            return window.location.host;
+        }
+        
+        const agentsGrid = document.getElementById('agents-grid');
+        const adminId = "admin_" + Date.now();
+        const wsUrl = `ws://${getServerHost()}/ws/admin/${adminId}`;
+        const ws = new WebSocket(wsUrl);
+        
+        let agentsData = {}; 
+        let currentListening = null;
+        let audioContext = null;
+        const SAMPLE_RATE = 48000;
+        
+        // Throttle metadata updates to prevent constant re-rendering
+        const updateThrottles = {};
+        const THROTTLE_MS = 500; // Only update UI every 500ms max
+        
+        // Fetch agents on page load
+        async function loadAgents() {
+            try {
+                const res = await fetch('/api/db_agents');
+                const data = await res.json();
+                const agentFilter = document.getElementById('agentExportFilter');
+                
+                // Clear existing options except "All Agents"
+                agentFilter.innerHTML = '<option value="ALL">All Agents</option>';
+                
+                // Add agents to dropdown
+                if (data.agents && data.agents.length > 0) {
+                    data.agents.forEach(agent => {
+                        const option = document.createElement('option');
+                        option.value = agent;
+                        option.textContent = agent;
+                        agentFilter.appendChild(option);
+                    });
+                }
+            } catch (e) {
+                console.error('Error loading agents:', e);
+            }
+        }
+        
+        // Load agents when page loads
+        loadAgents();
+        
+        function exportData(type) {
+            const agentFilter = document.getElementById('agentExportFilter');
+            const selectedAgent = agentFilter ? agentFilter.value : 'ALL';
+            
+            let url = `/api/export/${encodeURIComponent(type)}`;
+            if (selectedAgent && selectedAgent !== 'ALL') {
+                url += `?agent=${encodeURIComponent(selectedAgent)}`;
+            }
+            
+            window.location.href = url;
+        }
+
+        ws.onopen = () => {
+            console.log("WS Connected");
+            document.getElementById('connection-status').innerText = "🟢 System Online";
+            ws.send(JSON.stringify({ type: "get_full_list" }));
+        };
+        ws.onclose = () => {
+            document.getElementById('connection-status').innerText = "🔴 Disconnected";
+        };
+
+        ws.onmessage = async function(event) {
+            if (event.data instanceof Blob) {
+                handleAudio(event.data);
+                return;
+            }
+            
+            try {
+                const msg = JSON.parse(event.data);
+                
+                if (msg.type === 'agent_list') {
+                    msg.agents.forEach(agent => updateAgentState(agent.agent_id, agent));
+                    msg.agents.forEach(agent => fetchStats(agent.agent_id));
+                }
+                else if (msg.type === 'agent_connected') {
+                    updateAgentState(msg.agent_id, msg.metadata);
+                    fetchStats(msg.agent_id);
+                }
+                else if (msg.type === 'agent_disconnected') {
+                    if (agentsData[msg.agent_id]) {
+                        agentsData[msg.agent_id].status = 'disconnected';
+                        renderAgent(msg.agent_id);
+                    }
+                }
+                else if (msg.type === 'agent_metadata_update') {
+                    // Throttled in updateAgentState - won't spam re-renders
+                    updateAgentState(msg.agent_id, msg.metadata);
+                }
+                else if (msg.type === 'stats_update') {
+                    if (agentsData[msg.agent_id]) {
+                        agentsData[msg.agent_id].stats = msg.stats;
+                        renderAgent(msg.agent_id);
+                    }
+                }
+                else if (msg.type === 'listening_started') {
+                    console.log(`✅ Server confirmed: Listening to ${msg.agent_id}`);
+                }
+            } catch (e) { 
+                console.error("Error parsing message:", e); 
+            }
+        };
+        
+        ws.onerror = function(error) {
+            console.error("WebSocket error:", error);
+        };
+        
+        // Use event delegation for button clicks (works even when buttons are recreated)
+        agentsGrid.addEventListener('click', function(event) {
+            const button = event.target.closest('.listen-btn');
+            if (button && button.dataset.agentId) {
+                const agentId = button.dataset.agentId;
+                console.log(`Button clicked via event delegation for agent: ${agentId}`);
+                toggleListen(agentId);
+            }
+        });
+
+        async function fetchStats(agentId) {
+            try {
+                const res = await fetch(`/api/agent_stats/${agentId}`);
+                const stats = await res.json();
+                if (agentsData[agentId]) {
+                    agentsData[agentId].stats = stats;
+                    renderAgent(agentId);
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        function updateAgentState(id, metadata) {
+            if (!agentsData[id]) agentsData[id] = { stats: { calls_today: 0, calls_month: 0 }, status: 'connected' };
+            
+            // Check if this is just a last_audio update (not important for UI)
+            const isOnlyLastAudio = Object.keys(metadata).length === 1 && metadata.hasOwnProperty('last_audio');
+            
+            // Update the data
+            if (metadata.status) agentsData[id].status = metadata.status;
+            agentsData[id].metadata = { ...agentsData[id].metadata, ...metadata };
+            
+            // Throttle re-renders: skip if it's just last_audio and we've updated recently
+            const now = Date.now();
+            const lastUpdate = updateThrottles[id] || 0;
+            
+            if (isOnlyLastAudio && (now - lastUpdate) < THROTTLE_MS) {
+                // Skip rendering for frequent last_audio updates
+                return;
+            }
+            
+            // Important update - render it
+            updateThrottles[id] = now;
+            renderAgent(id);
+        }
+
+        function renderAgent(id) {
+            const data = agentsData[id];
+            if(!data) return;
+            
+            let card = document.getElementById(`card-${id}`);
+            
+            // Visual indicator for listening state
+            const isListening = currentListening === id;
+            const btnClass = isListening ? 'listen-btn active' : 'listen-btn';
+            const btnText = isListening ? '🎧 Stop Listening' : '🔊 Listen In';
+            
+            // If card exists, try to update only specific elements instead of replacing everything
+            if (card) {
+                // Update status badge
+                const statusBadge = card.querySelector('.status-badge');
+                if (statusBadge) {
+                    statusBadge.className = `status-badge ${data.status === 'connected' ? 'status-connected' : 'status-disconnected'}`;
+                    statusBadge.textContent = data.status;
+                }
+                
+                // Update live info
+                const liveInfo = card.querySelector('.live-info');
+                if (liveInfo) {
+                    const statusSpan = liveInfo.querySelector('.info-row:nth-child(1) span:last-child');
+                    const leadSpan = liveInfo.querySelector('.info-row:nth-child(2) span:last-child');
+                    const contactSpan = liveInfo.querySelector('.info-row:nth-child(3) span:last-child');
+                    
+                    if (statusSpan) {
+                        statusSpan.style.color = getStatusColor(data.metadata?.status);
+                        statusSpan.textContent = data.metadata?.status || 'Idle';
+                    }
+                    if (leadSpan) leadSpan.textContent = data.metadata?.lead || '-';
+                    if (contactSpan) contactSpan.textContent = data.metadata?.contact || '-';
+                }
+                
+                // Update stats
+                const statsRow = card.querySelector('.stats-row');
+                if (statsRow) {
+                    const todayStat = statsRow.querySelector('.stat-box:nth-child(1) .stat-num');
+                    const monthStat = statsRow.querySelector('.stat-box:nth-child(2) .stat-num');
+                    if (todayStat) todayStat.textContent = data.stats?.calls_today || 0;
+                    if (monthStat) monthStat.textContent = data.stats?.calls_month || 0;
+                }
+                
+                // Update button (only if state changed)
+                const button = card.querySelector('.listen-btn');
+                if (button) {
+                    const currentIsListening = button.classList.contains('active');
+                    if (currentIsListening !== isListening) {
+                        button.className = btnClass;
+                        button.textContent = btnText;
+                    }
+                }
+                
+                return; // Done with incremental update
+            }
+            
+            // Card doesn't exist - create it
+            const html = `
+                <div class="card-header">
+                    <div class="agent-name">${id}</div>
+                    <div class="status-badge ${data.status === 'connected' ? 'status-connected' : 'status-disconnected'}">${data.status}</div>
+                </div>
+                <div class="live-info">
+                    <div class="info-row"><span class="label">Status</span><span style="color: ${getStatusColor(data.metadata?.status)}">${data.metadata?.status || 'Idle'}</span></div>
+                    <div class="info-row"><span class="label">Lead</span><span>${data.metadata?.lead || '-'}</span></div>
+                    <div class="info-row"><span class="label">Contact</span><span>${data.metadata?.contact || '-'}</span></div>
+                </div>
+                <div class="stats-row">
+                    <div class="stat-box"><span class="stat-num">${data.stats?.calls_today || 0}</span><span class="stat-label">Today</span></div>
+                    <div class="stat-box"><span class="stat-num">${data.stats?.calls_month || 0}</span><span class="stat-label">Month</span></div>
+                </div>
+                <button id="btn-${id}" class="${btnClass}" data-agent-id="${id}">${btnText}</button>
+            `;
+
+            card = document.createElement('div');
+            card.id = `card-${id}`;
+            card.className = 'agent-card';
+            card.innerHTML = html;
+            agentsGrid.appendChild(card);
+        }
+
+        function getStatusColor(status) {
+            if (!status) return '#fff';
+            if (status.includes('Calling')) return '#ffc107';
+            if (status.includes('Call Ended')) return '#ff453a';
+            return '#2eea90';
+        }
+
+        // --- ROBUST AUDIO HANDLING ---
+        function toggleListen(id) {
+            console.log(`toggleListen called for agent: ${id}, currentListening: ${currentListening}`);
+            
+            if (currentListening === id) {
+                console.log("Stopping listening...");
+                ws.send(JSON.stringify({ type: "stop_listening" }));
+                currentListening = null;
+                if(audioContext) audioContext.suspend();
+                renderAgent(id);
+                console.log("Stopped listening.");
+            } else {
+                console.log(`Starting to listen to agent: ${id}`);
+                
+                // Check WebSocket state
+                if (ws.readyState !== WebSocket.OPEN) {
+                    console.error(`WebSocket not open! State: ${ws.readyState}`);
+                    alert("WebSocket connection lost. Please refresh the page.");
+                    return;
+                }
+                
+                // Initialize context on user click
+                if (!audioContext) {
+                    console.log("Creating new AudioContext...");
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                }
+                
+                // Always try to resume
+                audioContext.resume().then(() => {
+                    console.log("AudioContext resumed, sending listen request...");
+                    const message = { type: "listen_to_agent", agent_id: id };
+                    console.log("Sending message:", message);
+                    ws.send(JSON.stringify(message));
+                    currentListening = id;
+                    renderAgent(id);
+                    console.log(`Requesting audio for ${id}...`);
+                }).catch(e => {
+                    console.error("Error resuming AudioContext:", e);
+                });
+            }
+            // Reset others
+            Object.keys(agentsData).forEach(aid => {
+                if (aid !== id && currentListening === aid) renderAgent(aid);
+            });
+        }
+
+        function handleAudio(blob) {
+            if (!audioContext) return;
+            if (audioContext.state === 'suspended') audioContext.resume();
+
+            blob.arrayBuffer().then(buffer => {
+                // DEBUG: Log first few packets to confirm receipt
+                if (Math.random() < 0.05) { 
+                    console.log(`🔊 RX ${buffer.byteLength} bytes`); 
+                }
+
+                // 1. Create Float32 Buffer
+                const int16Data = new Int16Array(buffer);
+                const float32Data = new Float32Array(int16Data.length);
+                
+                for (let i = 0; i < int16Data.length; i++) {
+                    float32Data[i] = int16Data[i] / 32768.0;
+                }
+                
+                // 2. Schedule Playback
+                const audioBuffer = audioContext.createBuffer(1, float32Data.length, SAMPLE_RATE);
+                audioBuffer.copyToChannel(float32Data, 0);
+                
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.start();
+            }).catch(e => console.error("Audio Decode Error:", e));
+        }
+    </script>
+</body>
+</html>

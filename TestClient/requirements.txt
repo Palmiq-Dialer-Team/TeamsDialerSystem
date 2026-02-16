@@ -1,0 +1,9 @@
+websockets>=11.0
+numpy>=1.24.0
+PyQt6>=6.6.0
+pyaudiowpatch
+resampy
+requests
+livekit
+pydub
+pydub
