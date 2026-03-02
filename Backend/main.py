@@ -1,7 +1,7 @@
 """Central server: FastAPI + WebSocket for audio streaming."""
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +12,7 @@ import asyncio
 import os
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -20,6 +21,10 @@ import io
 import numpy as np
 from typing import Dict, Set, List, Optional, Any
 from datetime import datetime
+import hashlib
+import hmac
+import secrets
+import random
 from contextlib import asynccontextmanager
 import database
 from outlook_manager import OutlookManager
@@ -39,13 +44,6 @@ async def lifespan(app: "FastAPI"):
     _app_loop = asyncio.get_running_loop()
     print("Initializing Outlook Manager...")
     outlook_manager = OutlookManager()
-    threading.Thread(target=_preload_amd_background, daemon=True).start()
-    try:
-        from livekit_worker import run_worker_thread
-        threading.Thread(target=run_worker_thread, daemon=True).start()
-        print("[LiveKit] AMD worker thread started")
-    except ImportError as e:
-        print(f"[LiveKit] Worker not started (missing deps): {e}")
     scheduler_thread = threading.Thread(target=callback_scheduler, daemon=True)
     scheduler_thread.start()
     print("Callback scheduler thread started")
@@ -84,67 +82,70 @@ app.add_middleware(
 if os.path.isdir(ANNOUNCEMENT_IMAGES_DIR):
     app.mount("/static/announcements", StaticFiles(directory=ANNOUNCEMENT_IMAGES_DIR), name="announcement_images")
 
-_amd_detector = None
-_amd_load_error = None
-_ai_deps_ensured = False
-
-def _ensure_ai_dependencies():
-    """Install AMD deps (torch, faster-whisper) if missing."""
-    global _ai_deps_ensured
-    if _ai_deps_ensured:
-        return
-    _ai_deps_ensured = True
-    missing = []
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        missing.append("torch")
-    try:
-        import torchaudio  # noqa: F401
-    except ImportError:
-        missing.append("torchaudio")
-    try:
-        import faster_whisper  # noqa: F401
-    except ImportError:
-        missing.append("faster-whisper")
-    if missing:
-        print(f"[AI] Installing missing dependencies: {missing}")
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
-                capture_output=True,
-                timeout=300,
-                cwd=BASE_DIR,
-            )
-            print(f"[AI] Installed: {missing}")
-        except Exception as e:
-            print(f"[AI] pip install failed: {e}")
-
-def get_amd_detector():
-    """Lazy-load AMD detector. Returns (detector, error)."""
-    global _amd_detector, _amd_load_error
-    if _amd_detector is not None:
-        return _amd_detector, None
-    if _amd_load_error is not None:
-        return None, _amd_load_error
-    _ensure_ai_dependencies()
-    try:
-        from ai_core import AMDDetector
-        _amd_detector = AMDDetector()
-        print("[AI] AMD detector (Silero VAD + faster-whisper) ready.")
-        return _amd_detector, None
-    except Exception as e:
-        _amd_load_error = str(e)
-        print(f"[AI] AMD detector failed to load (monitoring disabled): {e}")
-        return None, _amd_load_error
-
 # Global Outlook manager - initialized in lifespan before accepting connections
 outlook_manager: Optional[OutlookManager] = None
 
 
-def _preload_amd_background():
-    """Pre-load AMD detector in background so first call does not block."""
-    get_amd_detector()
+# ---------------- Remote console configuration ----------------
+
+REMOTE_CONSOLE_ENABLED = os.getenv("REMOTE_CONSOLE_ENABLED", "0").lower() in ("1", "true", "yes")
+REMOTE_CONSOLE_PASSWORD_HASH = os.getenv("REMOTE_CONSOLE_PASSWORD_HASH", "").strip()
+REMOTE_CONSOLE_SESSION_TTL_SECONDS = int(os.getenv("REMOTE_CONSOLE_SESSION_TTL_SECONDS", "3600") or "3600")
+REMOTE_CONSOLE_MAX_ATTEMPTS = int(os.getenv("REMOTE_CONSOLE_MAX_ATTEMPTS", "5") or "5")
+REMOTE_CONSOLE_ATTEMPT_WINDOW_SECONDS = int(os.getenv("REMOTE_CONSOLE_ATTEMPT_WINDOW_SECONDS", "900") or "900")
+_raw_log_path = os.getenv("REMOTE_CONSOLE_LOG_PATH", "").strip() or os.path.join(BASE_DIR, "server.log")
+REMOTE_CONSOLE_LOG_PATH = os.path.normpath(os.path.abspath(_raw_log_path) if os.path.isabs(_raw_log_path) else os.path.join(BASE_DIR, _raw_log_path))
+
+remote_console_sessions: Dict[str, Dict[str, Any]] = {}
+remote_console_failed_attempts: Dict[str, List[float]] = {}
+remote_console_captcha: Dict[str, int] = {}
+
+
+def _remote_console_is_enabled() -> bool:
+    return REMOTE_CONSOLE_ENABLED and bool(REMOTE_CONSOLE_PASSWORD_HASH)
+
+
+def _hash_remote_console_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _remote_console_verify_password(password: str) -> bool:
+    if not REMOTE_CONSOLE_PASSWORD_HASH:
+        return False
+    computed = _hash_remote_console_password(password)
+    return hmac.compare_digest(computed, REMOTE_CONSOLE_PASSWORD_HASH)
+
+
+def _remote_console_prune_attempts(ip: str, now: float) -> List[float]:
+    attempts = remote_console_failed_attempts.get(ip, [])
+    cutoff = now - REMOTE_CONSOLE_ATTEMPT_WINDOW_SECONDS
+    attempts = [t for t in attempts if t >= cutoff]
+    remote_console_failed_attempts[ip] = attempts
+    return attempts
+
+
+def _remote_console_is_rate_limited(ip: str, now: float) -> bool:
+    attempts = _remote_console_prune_attempts(ip, now)
+    return len(attempts) >= REMOTE_CONSOLE_MAX_ATTEMPTS
+
+
+def _remote_console_record_failure(ip: str, now: float) -> None:
+    attempts = _remote_console_prune_attempts(ip, now)
+    attempts.append(now)
+    remote_console_failed_attempts[ip] = attempts
+
+
+def _remote_console_get_session(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not session_id:
+        return None
+    data = remote_console_sessions.get(session_id)
+    if not data:
+        return None
+    expires_at = data.get("expires_at")
+    if expires_at and expires_at < time.time():
+        remote_console_sessions.pop(session_id, None)
+        return None
+    return data
 
 
 async def _send_callback_prompts():
@@ -239,10 +240,14 @@ class ConnectionManager:
             "metadata": self.agent_metadata[agent_id]
         })
     
-    async def disconnect_agent(self, agent_id: str):
-        """Remove an agent connection"""
-        if agent_id in self.agent_connections:
-            del self.agent_connections[agent_id]
+    async def disconnect_agent(self, agent_id: str, websocket: WebSocket = None):
+        """Remove an agent connection. If websocket is given, only remove if it's the current connection (reconnect-safe)."""
+        current = self.agent_connections.get(agent_id)
+        if current is None:
+            return
+        if websocket is not None and current is not websocket:
+            return  # different connection replaced this one; don't remove
+        del self.agent_connections[agent_id]
         
         if agent_id in self.agent_metadata:
             self.agent_metadata[agent_id]["status"] = "disconnected"
@@ -358,10 +363,21 @@ class ConnectionManager:
 # Global connection manager
 manager = ConnectionManager()
 
+# Maintenance restart state: current maintenance run ID + per-agent opt-out set
+current_maintenance_id: Optional[str] = None
+maintenance_opt_out_agents: Set[str] = set()
+
 
 class AnnouncementRequest(BaseModel):
     message: str
     image: Optional[str] = None  # Filename from announcement_images/ or null for none
+
+
+class MaintenanceRequest(BaseModel):
+    maintenance_id: Optional[str] = None
+    restart_in_seconds: Optional[int] = None
+    scheduled_time: Optional[str] = None
+    message: Optional[str] = None
 
 
 @app.post("/api/control/shutdown")
@@ -372,6 +388,63 @@ async def shutdown_endpoint(request: Request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     os.kill(os.getpid(), signal.SIGTERM)
     return {"ok": True}
+
+
+@app.post("/api/control/maintenance_warning")
+async def maintenance_warning_endpoint(request: Request, body: MaintenanceRequest):
+    """Send maintenance warning to all agents. Localhost-only."""
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    global current_maintenance_id, maintenance_opt_out_agents
+    maintenance_id = body.maintenance_id or str(int(time.time()))
+    current_maintenance_id = maintenance_id
+    maintenance_opt_out_agents = set()
+    payload = {
+        "type": "maintenance_warning",
+        "maintenance_id": maintenance_id,
+        "restart_in_seconds": body.restart_in_seconds or 300,
+        "scheduled_time": body.scheduled_time or "",
+        "message": body.message or "Nightly maintenance restart is scheduled.",
+    }
+    await manager.broadcast_to_agents(payload)
+    return {
+        "ok": True,
+        "maintenance_id": maintenance_id,
+        "sent_to": len(manager.agent_connections),
+    }
+
+
+@app.post("/api/control/maintenance_shutdown")
+async def maintenance_shutdown_endpoint(request: Request, body: MaintenanceRequest):
+    """Send maintenance shutdown to all agents except those who opted out. Localhost-only."""
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    global current_maintenance_id
+    maintenance_id = body.maintenance_id or current_maintenance_id
+    if not maintenance_id:
+        return JSONResponse({"error": "No maintenance_id specified or active."}, status_code=400)
+    payload = {
+        "type": "maintenance_shutdown",
+        "maintenance_id": maintenance_id,
+    }
+    sent = 0
+    for agent_id, websocket in list(manager.agent_connections.items()):
+        if agent_id in maintenance_opt_out_agents:
+            continue
+        try:
+            await websocket.send_json(payload)
+            sent += 1
+        except Exception as e:
+            print(f"[MAINT] Error sending maintenance_shutdown to {agent_id}: {e}")
+            await manager.disconnect_agent(agent_id)
+    return {
+        "ok": True,
+        "maintenance_id": maintenance_id,
+        "sent_to": sent,
+        "opted_out": len(maintenance_opt_out_agents),
+    }
 
 
 @app.post("/api/control/announcement")
@@ -388,10 +461,217 @@ async def announcement_endpoint(request: Request, body: AnnouncementRequest):
     return {"ok": True, "sent_to": len(manager.agent_connections)}
 
 
+# ---------------- Remote console endpoints ----------------
+
+
+@app.get("/remote-console/login", response_class=HTMLResponse)
+async def remote_console_login_page(request: Request):
+    """Login form for remote console."""
+    if not _remote_console_is_enabled():
+        return HTMLResponse("Remote console is disabled.", status_code=404)
+
+    # If already have a valid session, go straight to panel
+    session_id = request.cookies.get("remote_console_session")
+    if _remote_console_get_session(session_id):
+        return RedirectResponse(url="/remote-console/panel", status_code=303)
+
+    a = random.randint(1, 9)
+    b = random.randint(1, 9)
+    answer = a + b
+    captcha_id = secrets.token_urlsafe(16)
+    remote_console_captcha[captcha_id] = answer
+
+    context = {
+        "request": request,
+        "captcha_question": f"{a} + {b} = ?",
+        "captcha_id": captcha_id,
+        "error": "",
+    }
+    return templates.TemplateResponse("remote_console_login.html", context)
+
+
+@app.post("/remote-console/login", response_class=HTMLResponse)
+async def remote_console_login_submit(request: Request):
+    """Handle remote console login submission."""
+    if not _remote_console_is_enabled():
+        return HTMLResponse("Remote console is disabled.", status_code=404)
+
+    form = await request.form()
+    client_ip = request.client.host if request.client else ""
+    now = time.time()
+
+    if _remote_console_is_rate_limited(client_ip, now):
+        time.sleep(1.0)
+        a = random.randint(1, 9)
+        b = random.randint(1, 9)
+        answer = a + b
+        captcha_id = secrets.token_urlsafe(16)
+        remote_console_captcha[captcha_id] = answer
+        context = {
+            "request": request,
+            "captcha_question": f"{a} + {b} = ?",
+            "captcha_id": captcha_id,
+            "error": "Too many login attempts. Please try again later.",
+        }
+        return templates.TemplateResponse("remote_console_login.html", context, status_code=429)
+
+    password = (form.get("password") or "").strip()
+    captcha_id = form.get("captcha_id") or ""
+    captcha_answer_raw = (form.get("captcha_answer") or "").strip()
+
+    expected = remote_console_captcha.pop(captcha_id, None)
+    expected_int = None
+    given_int = None
+    try:
+        if expected is not None:
+            expected_int = int(expected)
+        given_int = int(captcha_answer_raw)
+    except (TypeError, ValueError):
+        expected_int = None
+        given_int = None
+
+    captcha_ok = expected_int is not None and given_int == expected_int
+    password_ok = _remote_console_verify_password(password)
+
+    if not (captcha_ok and password_ok):
+        _remote_console_record_failure(client_ip, now)
+        a = random.randint(1, 9)
+        b = random.randint(1, 9)
+        answer = a + b
+        new_captcha_id = secrets.token_urlsafe(16)
+        remote_console_captcha[new_captcha_id] = answer
+        context = {
+            "request": request,
+            "captcha_question": f"{a} + {b} = ?",
+            "captcha_id": new_captcha_id,
+            "error": "Invalid credentials or captcha.",
+        }
+        return templates.TemplateResponse("remote_console_login.html", context, status_code=400)
+
+    # Success: create session
+    session_id = secrets.token_urlsafe(32)
+    csrf_token = secrets.token_urlsafe(32)
+    remote_console_sessions[session_id] = {
+        "expires_at": now + REMOTE_CONSOLE_SESSION_TTL_SECONDS,
+        "csrf_token": csrf_token,
+    }
+
+    response = RedirectResponse(url="/remote-console/panel", status_code=303)
+    response.set_cookie(
+        "remote_console_session",
+        session_id,
+        httponly=True,
+        samesite="lax",
+        max_age=REMOTE_CONSOLE_SESSION_TTL_SECONDS,
+    )
+    return response
+
+
+@app.get("/remote-console/panel", response_class=HTMLResponse)
+async def remote_console_panel(request: Request):
+    """Main remote console panel (requires session)."""
+    if not _remote_console_is_enabled():
+        return HTMLResponse("Remote console is disabled.", status_code=404)
+
+    session_id = request.cookies.get("remote_console_session")
+    session = _remote_console_get_session(session_id)
+    if not session:
+        return RedirectResponse(url="/remote-console/login", status_code=303)
+
+    csrf_token = session.get("csrf_token", "")
+    context = {
+        "request": request,
+        "csrf_token": csrf_token,
+    }
+    return templates.TemplateResponse("remote_console_panel.html", context)
+
+
+@app.get("/remote-console/logs")
+async def remote_console_logs(request: Request, lines: int = 200):
+    """Return tail of log file for remote console."""
+    if not _remote_console_is_enabled():
+        return JSONResponse({"error": "disabled"}, status_code=404)
+
+    session_id = request.cookies.get("remote_console_session")
+    session = _remote_console_get_session(session_id)
+    if not session:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        lines = max(10, min(int(lines), 1000))
+    except ValueError:
+        lines = 200
+
+    tail_lines: List[str]
+    try:
+        with open(REMOTE_CONSOLE_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        tail_lines = all_lines[-lines:]
+    except FileNotFoundError:
+        try:
+            with open(REMOTE_CONSOLE_LOG_PATH, "w", encoding="utf-8") as f:
+                f.write("")
+            tail_lines = [f"Log file created at {REMOTE_CONSOLE_LOG_PATH}\n", "Configure uvicorn or your process to write logs here (e.g. redirect stderr).\n"]
+        except OSError:
+            tail_lines = [f"Log file not found and could not be created: {REMOTE_CONSOLE_LOG_PATH}\n", "Set REMOTE_CONSOLE_LOG_PATH in .env to a writable path.\n"]
+
+    return JSONResponse({"lines": tail_lines})
+
+
+@app.post("/remote-console/shutdown")
+async def remote_console_shutdown(request: Request):
+    """Graceful shutdown triggered from remote console (session + CSRF protected)."""
+    if not _remote_console_is_enabled():
+        return JSONResponse({"error": "disabled"}, status_code=404)
+
+    session_id = request.cookies.get("remote_console_session")
+    session = _remote_console_get_session(session_id)
+    if not session:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    form = await request.form()
+    csrf_form = (form.get("csrf_token") or "").strip()
+    csrf_expected = session.get("csrf_token", "")
+    if not csrf_form or not hmac.compare_digest(csrf_form, csrf_expected):
+        return JSONResponse({"error": "invalid_csrf"}, status_code=400)
+
+    print("[RemoteConsole] Shutdown requested via remote console.")
+    os.kill(os.getpid(), signal.SIGTERM)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/remote-console/restart")
+async def remote_console_restart(request: Request):
+    """Logical restart from remote console: same as shutdown (external watchdog restarts uvicorn)."""
+    if not _remote_console_is_enabled():
+        return JSONResponse({"error": "disabled"}, status_code=404)
+
+    session_id = request.cookies.get("remote_console_session")
+    session = _remote_console_get_session(session_id)
+    if not session:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    form = await request.form()
+    csrf_form = (form.get("csrf_token") or "").strip()
+    csrf_expected = session.get("csrf_token", "")
+    if not csrf_form or not hmac.compare_digest(csrf_form, csrf_expected):
+        return JSONResponse({"error": "invalid_csrf"}, status_code=400)
+
+    print("[RemoteConsole] Restart requested via remote console (graceful shutdown, external restart expected).")
+    os.kill(os.getpid(), signal.SIGTERM)
+    return JSONResponse({"ok": True})
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     """Admin monitor dashboard"""
     return templates.TemplateResponse("dashboard.html", {"request": request})
+
+
+@app.get("/audio-test", response_class=HTMLResponse)
+async def audio_test_page(request: Request):
+    """Audio testing page: listen to stream from Opus test client (TesterAgent)."""
+    return templates.TemplateResponse("audio_test.html", {"request": request})
 
 
 @app.websocket("/ws/{agent_id}")
@@ -400,34 +680,15 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
     import database  # Import at function level to ensure availability
     await manager.connect_agent(agent_id, websocket)
     
-    amd_state = None
-    call_start_time = 0
-    is_ringing_state = False
-    ai_available_for_call = False
-    amd_last_log_elapsed = -1  # For periodic "still listening" logs
-    RING_TIMEOUT = 30
     audio_packets_received = 0  # Diagnostic: track audio reception
     
     try:
         while True:
-            # Use 1s timeout so we can send force_hangup even when no audio arrives
+            # Use 1s timeout so we can periodically wake up the loop; AMD and timeouts are handled on the client.
             try:
                 data = await asyncio.wait_for(websocket.receive(), timeout=1.0)
             except asyncio.TimeoutError:
-                # No message in 1s - check no-audio timeout (server-driven hangup)
-                if is_ringing_state and call_start_time > 0:
-                    elapsed = time.time() - call_start_time
-                    if elapsed > RING_TIMEOUT:
-                        if ai_available_for_call:
-                            print(f"[AI] Agent {agent_id}: No-audio timeout ({RING_TIMEOUT}s). Sending hangup.")
-                            try:
-                                await websocket.send_json({"type": "force_hangup", "reason": "timeout"})
-                            except Exception:
-                                pass
-                        # When AMD unavailable, do NOT send force_hangup—cannot verify no-answer, would risk hanging up on live person
-                        is_ringing_state = False
-                        amd_state = None
-                        amd_last_log_elapsed = -1
+                # No message in 1s - client-side AMD handles timeouts; server just keeps the connection alive.
                 continue
             
             # Handle Mixed Types: Use receive() to get both text and bytes
@@ -448,26 +709,12 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                         
                         if message.get("type") == "call_started":
                             print(f"[RECV] Agent {agent_id}: call_started received")
-                            detector, load_err = get_amd_detector()
-                            ai_available_for_call = detector is not None
-                            if not ai_available_for_call:
-                                await websocket.send_json({"type": "ai_unavailable", "reason": load_err or "AI not loaded"})
-                                print(f"[AI] Agent {agent_id}: Call started. AMD unavailable - no server-driven hangup (client manual mode).")
-                            else:
-                                from ai_core import AMDState
-                                amd_state = AMDState(detector)
-                                print(f"[AI] Agent {agent_id}: Call started. AMD monitoring active (VAD + Whisper).")
-                            is_ringing_state = True
-                            call_start_time = time.time()
                         
                         elif message.get("status") == "Call Ended":
-                            is_ringing_state = False
-                            amd_state = None
-                            amd_last_log_elapsed = -1
                             if audio_packets_received > 0:
                                 print(f"[RECV] Agent {agent_id}: call ended (total {audio_packets_received} audio packets received)")
                             audio_packets_received = 0
-                            print(f"[AI] Agent {agent_id}: Call ended")
+                            print(f"Agent {agent_id}: Call ended")
                         
                         # Handle metadata updates
                         elif message.get("type") == "metadata":
@@ -484,6 +731,12 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                                     "stats": new_stats,
                                 })
                         
+                        # Handle agent maintenance opt-out
+                        elif message.get("type") == "maintenance_opt_out":
+                            maint_id = message.get("maintenance_id")
+                            if maint_id and maint_id == current_maintenance_id:
+                                maintenance_opt_out_agents.add(agent_id)
+                                print(f"[MAINT] Agent {agent_id} opted out of maintenance {maint_id}")
                         # Handle callback operations
                         elif message.get("type") == "create_callback":
                             scheduled_time = message.get("scheduled_time")
@@ -512,39 +765,26 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                             
                             if agent_email:
                                 print(f"Creating Outlook event for {agent_id} at {agent_email}...")
-                                # Parse contact details for the email body
                                 try:
-                                    c_data = json.loads(contact_data)
-                                    first = c_data.get('First Name', '')
-                                    last = c_data.get('Last Name', '')
-                                    company = c_data.get('Company', '')
-                                    phones = ", ".join([str(p) for p in c_data.get('Phones', [])])
-                                    emails = c_data.get('Emails', [])
-                                    contact_emails = ", ".join([str(e) for e in emails]) if emails else "None"
-                                    
-                                    subject = f"Callback: {first} {last} ({company})"
-                                    body = f"""
-                                    <h3>Callback Reminder</h3>
-                                    <p><b>Contact:</b> {first} {last}</p>
-                                    <p><b>Company:</b> {company}</p>
-                                    <p><b>Phone(s):</b> {phones}</p>
-                                    <p><b>Email(s):</b> {contact_emails}</p>
-                                    <p><b>Notes:</b> {notes}</p>
-                                    """
-                                    
-                                    # Run in background thread to not block WebSocket
+                                    c_data = json.loads(contact_data) if isinstance(contact_data, str) else (contact_data if isinstance(contact_data, dict) else {})
+                                except (json.JSONDecodeError, TypeError):
+                                    c_data = {}
+                                try:
+                                    subject, body = outlook_manager.format_callback_event(
+                                        c_data,
+                                        notes=notes,
+                                        source_workbook_path=source_workbook_path,
+                                        source_sheet_name=source_sheet_name,
+                                    )
+                                    emails = c_data.get("Emails", []) if isinstance(c_data, dict) else []
                                     threading.Thread(
                                         target=outlook_manager.create_event,
                                         args=(subject, body, scheduled_time, agent_email, message.get("timezone", "ET"), emails),
                                         daemon=True
                                     ).start()
-                                    print(f"✅ Outlook invite thread started for {agent_id}")
-                                    
-                                except json.JSONDecodeError as json_e:
-                                    print(f"❌ ERROR: Failed to parse contact_data JSON for Outlook invite: {json_e}")
-                                    print(f"   Raw contact_data: {contact_data[:200]}...")  # First 200 chars
+                                    print(f"[OK] Outlook invite thread started for {agent_id}")
                                 except Exception as e:
-                                    print(f"❌ ERROR: Failed to prepare Outlook invite: {e}")
+                                    print(f"[ERROR] Failed to prepare Outlook invite: {e}")
                                     import traceback
                                     traceback.print_exc()
                             else:
@@ -571,41 +811,29 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                             if agent_email:
                                 print(f"Rescheduling Outlook event for {agent_id} at {agent_email}...")
                                 try:
-                                    # Get contact_data from message or fetch from callback record
                                     contact_data = message.get("contact_data")
-                                    callback_record = None
-                                    if not contact_data:
-                                        # Try to get from callback record if available
-                                        callback_record = database.get_callback(callback_id)
-                                        if callback_record:
-                                            contact_data = callback_record.get("contact_data", "{}")
-                                    
+                                    callback_record = database.get_callback(callback_id) if callback_id else None
+                                    if not contact_data and callback_record:
+                                        contact_data = callback_record.get("contact_data", "{}")
+                                    c_data = {}
                                     if contact_data:
-                                        c_data = json.loads(contact_data) if isinstance(contact_data, str) else contact_data
-                                        first = c_data.get('First Name', '')
-                                        last = c_data.get('Last Name', '')
-                                        company = c_data.get('Company', '')
-                                        phones = ", ".join([str(p) for p in c_data.get('Phones', [])])
-                                        emails = c_data.get('Emails', [])
-                                        contact_emails = ", ".join([str(e) for e in emails]) if emails else "None"
-                                        notes = message.get("notes") or (callback_record.get("notes") if callback_record else "")
-                                        
-                                        subject = f"Callback: {first} {last} ({company})"
-                                        body = f"""
-                                        <h3>Callback Reminder (Rescheduled)</h3>
-                                        <p><b>Contact:</b> {first} {last}</p>
-                                        <p><b>Company:</b> {company}</p>
-                                        <p><b>Phone(s):</b> {phones}</p>
-                                        <p><b>Email(s):</b> {contact_emails}</p>
-                                        <p><b>Notes:</b> {notes}</p>
-                                        """
-                                        
-                                        # Run in background thread to not block WebSocket
-                                        threading.Thread(
-                                            target=outlook_manager.create_event,
-                                            args=(subject, body, new_scheduled_time, agent_email, message.get("timezone", "ET"), emails),
-                                            daemon=True
-                                        ).start()
+                                        c_data = json.loads(contact_data) if isinstance(contact_data, str) else (contact_data if isinstance(contact_data, dict) else {})
+                                    notes_reschedule = message.get("notes") or (callback_record.get("notes", "") if callback_record else "") or ""
+                                    source_path = message.get("source_workbook_path") or (callback_record.get("source_workbook_path") if callback_record else None)
+                                    source_sheet = message.get("source_sheet_name") or (callback_record.get("source_sheet_name") if callback_record else None)
+                                    subject, body = outlook_manager.format_callback_event(
+                                        c_data,
+                                        notes=notes_reschedule,
+                                        source_workbook_path=source_path,
+                                        source_sheet_name=source_sheet,
+                                    )
+                                    body = body.replace("<h3>Callback Reminder</h3>", "<h3>Callback Reminder (Rescheduled)</h3>")
+                                    emails = c_data.get("Emails", []) if isinstance(c_data, dict) else []
+                                    threading.Thread(
+                                        target=outlook_manager.create_event,
+                                        args=(subject, body, new_scheduled_time, agent_email, message.get("timezone", "ET"), emails),
+                                        daemon=True
+                                    ).start()
                                 except Exception as e:
                                     print(f"Error preparing Outlook invite for rescheduled callback: {e}")
                             
@@ -779,95 +1007,10 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                         else:
                             system_channel = None
                         
-                        # 3. Broadcast to Admin
+                        # Broadcast to Admin (dashboard / listen-in)
                         await manager.broadcast_audio_to_admin(agent_id, dashboard_audio)
                         
-                        # 4. AMD Processing (VAD + Whisper, non-blocking, fail-safe to human)
-                        if is_ringing_state and amd_state is not None:
-                            elapsed = time.time() - call_start_time
-                            elapsed_int = int(elapsed)
-                            if system_channel is None:
-                                if elapsed_int != amd_last_log_elapsed and elapsed_int > 0 and elapsed_int % 5 == 0:
-                                    amd_last_log_elapsed = elapsed_int
-                                    print(f"[AI] Agent {agent_id}: AMD waiting - no stereo audio ({elapsed_int}s). Is loopback streaming?")
-                            else:
-                                try:
-                                    system_float = system_channel.astype(np.float32) / 32768.0
-                                    # Diagnostic: RMS of both channels - channel0=mic, channel1=loopback (used for AMD)
-                                    # If loopback RMS ~0 but mic RMS > 0, possible channel swap or wrong loopback device
-                                    rms_ch0 = float(np.sqrt(np.mean((stereo[:, 0].astype(np.float32) / 32768.0) ** 2)))
-                                    rms_ch1 = float(np.sqrt(np.mean(system_float ** 2)))
-                                    if not hasattr(amd_state, "_rms_log_ctr"):
-                                        amd_state._rms_log_ctr = 0
-                                    amd_state._rms_log_ctr += 1
-                                    if amd_state._rms_log_ctr % 50 == 0:
-                                        print(f"[AI] AMD DEBUG: ch0(mic) RMS={rms_ch0:.4f}, ch1(loopback) RMS={rms_ch1:.4f}")
-
-                                    # Log first audio + periodic "still listening" every 5s
-                                    if amd_last_log_elapsed == -1 and elapsed_int >= 0:
-                                        amd_last_log_elapsed = 0
-                                        print(f"[AI] Agent {agent_id}: AMD receiving stereo audio, listening for speech...")
-                                    elif elapsed_int != amd_last_log_elapsed and elapsed_int > 0 and elapsed_int % 5 == 0:
-                                        amd_last_log_elapsed = elapsed_int
-                                        print(f"[AI] Agent {agent_id}: AMD listening... {elapsed_int}s elapsed, waiting for speech")
-
-                                    if elapsed > RING_TIMEOUT:
-                                        if ai_available_for_call:
-                                            print(f"[AI] Agent {agent_id}: Timeout ({RING_TIMEOUT}s). Sending hangup.")
-                                            await websocket.send_json({"type": "force_hangup", "reason": "timeout"})
-                                        # When AMD unavailable, do NOT send force_hangup—cannot verify no-answer, would risk hanging up on live person
-                                        is_ringing_state = False
-                                        amd_state = None
-                                        amd_last_log_elapsed = -1
-                                    else:
-                                        result = amd_state.process_chunk(system_float, elapsed + call_start_time)
-                                        if result is not None:
-                                            if result[0] == "human_detected":
-                                                print(f"[AI] Agent {agent_id}: Human detected (VAD).")
-                                                is_ringing_state = False
-                                                amd_state = None
-                                                amd_last_log_elapsed = -1
-                                                await websocket.send_json({"type": "human_detected"})
-                                            elif result[0] == "force_hangup":
-                                                reason = result[1]
-                                                print(f"[AI] Agent {agent_id}: {reason}. Sending hangup.")
-                                                is_ringing_state = False
-                                                amd_state = None
-                                                amd_last_log_elapsed = -1
-                                                await websocket.send_json({"type": "force_hangup", "reason": reason})
-                                            elif result[0] == "transcribe":
-                                                _, buf, dur = result
-                                                print(f"[AI] Agent {agent_id}: Speech buffered (5s), transcribing...")
-                                                try:
-                                                    from ai_core import analyze_buffered_audio
-                                                    detector = amd_state.detector
-                                                    action, reason = await asyncio.wait_for(
-                                                        asyncio.to_thread(analyze_buffered_audio, detector, buf, dur),
-                                                        timeout=10.0
-                                                    )
-                                                    if action == "human_detected":
-                                                        print(f"[AI] Agent {agent_id}: Human detected (greeting).")
-                                                        is_ringing_state = False
-                                                        amd_state = None
-                                                        amd_last_log_elapsed = -1
-                                                        await websocket.send_json({"type": "human_detected"})
-                                                    elif action == "continue":
-                                                        # Non-speech/unintelligible: reset AMD, keep waiting for real voice
-                                                        print(f"[AI] Agent {agent_id}: {reason}. Resetting, will keep waiting up to timeout.")
-                                                        amd_state.reset()
-                                                    else:
-                                                        print(f"[AI] Agent {agent_id}: {reason}. Sending hangup.")
-                                                        is_ringing_state = False
-                                                        amd_state = None
-                                                        amd_last_log_elapsed = -1
-                                                        await websocket.send_json({"type": "force_hangup", "reason": reason})
-                                                except asyncio.TimeoutError:
-                                                    print(f"[AI] Agent {agent_id}: Transcription timeout (fail-safe: keep call)")
-                                                except Exception as ai_err:
-                                                    print(f"[AI] Agent {agent_id}: AMD analysis error (fail-safe: keep call): {ai_err}")
-                                except Exception as buf_err:
-                                    print(f"[AI] Agent {agent_id}: AMD buffer error (skipped): {buf_err}")
-                        
+                        # Update last_audio timestamp for dashboards
                         await manager.update_agent_metadata(agent_id, {"last_audio": datetime.now().isoformat()})
                     except Exception as audio_err:
                         print(f"[AUDIO] Agent {agent_id}: Audio processing error (continuing): {audio_err}")
@@ -877,16 +1020,116 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                 continue
     
     except WebSocketDisconnect:
-        await manager.disconnect_agent(agent_id)
+        await manager.disconnect_agent(agent_id, websocket)
     except OSError as e:
         winerr = getattr(e, "winerror", None)
         if winerr == 121:
             print(f"[NET] Agent {agent_id}: WinError 121 (semaphore timeout) - data transfer failed, connection closed")
         print(f"Critical WebSocket error for agent {agent_id}: {e}")
-        await manager.disconnect_agent(agent_id)
+        await manager.disconnect_agent(agent_id, websocket)
     except Exception as e:
         print(f"Critical WebSocket error for agent {agent_id}: {e}")
-        await manager.disconnect_agent(agent_id)
+        await manager.disconnect_agent(agent_id, websocket)
+
+
+@app.websocket("/ws/opus/{agent_id}")
+async def websocket_opus_agent(websocket: WebSocket, agent_id: str):
+    """Experimental Opus WebSocket: jitter buffer decouples socket from playback. Socket pushes; decoder stream yields at steady pace."""
+    import database  # noqa: F401
+    import queue as queue_module
+    from opus_handler import OpusDecoder
+    await manager.connect_agent(agent_id, websocket)
+    decoder = OpusDecoder()
+    RING_TIMEOUT = 30
+    # Shared state for socket loop and audio consumer (no server-side AMD; client handles AMD)
+    opus_state = {
+        "audio_packets_received": 0,
+    }
+    pcm_queue: queue_module.Queue = queue_module.Queue()
+    loop = asyncio.get_event_loop()
+
+    def run_audio_stream():
+        for pcm_bytes in decoder.get_audio_stream():
+            pcm_queue.put(pcm_bytes)
+        pcm_queue.put(None)
+
+    stream_thread = threading.Thread(target=run_audio_stream, daemon=True)
+    stream_thread.start()
+
+    async def consume_audio():
+        nonlocal opus_state
+        while True:
+            pcm_bytes = await loop.run_in_executor(None, pcm_queue.get)
+            if pcm_bytes is None:
+                break
+            opus_state["audio_packets_received"] = opus_state.get("audio_packets_received", 0) + 1
+            n = opus_state["audio_packets_received"]
+            if n == 1 or n % 100 == 0:
+                print(f"[RECV] Opus Agent {agent_id}: audio packet #{n}, {len(pcm_bytes)} PCM bytes")
+            if n % 50 == 0:
+                try:
+                    await websocket.send_json({"type": "audio_ack", "packets_received": n})
+                except Exception:
+                    pass
+            audio_chunk_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+            dashboard_audio = pcm_bytes
+            if len(audio_chunk_int16) % 2 == 0:
+                stereo = audio_chunk_int16.reshape(-1, 2)
+                mono_mix = np.mean(stereo, axis=1).astype(np.int16)
+                dashboard_audio = mono_mix.tobytes()
+            # Forward to admin listeners (dashboard / monitor)
+            await manager.broadcast_audio_to_admin(agent_id, dashboard_audio)
+            # Update last_audio timestamp for dashboards
+            await manager.update_agent_metadata(agent_id, {"last_audio": datetime.now().isoformat()})
+
+    consumer_task = asyncio.create_task(consume_audio())
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.receive(), timeout=1.0)
+            except asyncio.TimeoutError:
+                # No message in 1s; client-side AMD handles any timeouts.
+                continue
+            if data.get("type") == "websocket.disconnect":
+                break
+            if "text" in data:
+                try:
+                    message = json.loads(data["text"])
+                    if message.get("type") == "call_started":
+                        opus_state["audio_packets_received"] = 0
+                        print(f"[RECV] Opus Agent {agent_id}: call_started received")
+                    elif message.get("status") == "Call Ended":
+                        opus_state["audio_packets_received"] = 0
+                    elif message.get("type") == "metadata":
+                        metadata_data = message.get("data", {})
+                        await manager.update_agent_metadata(agent_id, metadata_data)
+                    elif message.get("type") == "maintenance_opt_out":
+                        maint_id = message.get("maintenance_id")
+                        if maint_id and maint_id == current_maintenance_id:
+                            maintenance_opt_out_agents.add(agent_id)
+                            print(f"[MAINT] Opus agent {agent_id} opted out of maintenance {maint_id}")
+                except json.JSONDecodeError:
+                    pass
+                continue
+            if "bytes" in data:
+                raw = data["bytes"]
+                if len(raw) >= 4:
+                    length = struct.unpack("!I", raw[:4])[0]
+                    opus_bytes = raw[4:4 + length]
+                    if len(opus_bytes) == length:
+                        decoder.decode(opus_bytes)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"Opus WebSocket error for {agent_id}: {e}")
+    finally:
+        decoder.stop()
+        consumer_task.cancel()
+        try:
+            await consumer_task
+        except asyncio.CancelledError:
+            pass
+        await manager.disconnect_agent(agent_id, websocket)
 
 
 @app.websocket("/ws/admin/{admin_id}")
@@ -1170,44 +1413,6 @@ async def create_call(call: CallLogCreate):
             content={"detail": "Failed to create call record"}
         )
 
-
-@app.get("/api/livekit/token")
-async def livekit_token(agent_id: str):
-    """
-    Generate a LiveKit access token for an agent to join the dispatch room.
-    Registers the agent in manager so they appear on the dashboard for Listen.
-    """
-    try:
-        from livekit.api import AccessToken, VideoGrants
-        token = AccessToken(
-            api_key=os.getenv("LIVEKIT_API_KEY", "devkey"),
-            api_secret=os.getenv("LIVEKIT_API_SECRET", "secret"),
-        )
-        token.with_identity(agent_id).with_grants(
-            VideoGrants(room_join=True, room="dispatch-room")
-        )
-        # Register LiveKit agent for dashboard (so Listen works)
-        manager.agent_metadata[agent_id] = {
-            "status": "connected",
-            "last_seen": datetime.now().isoformat(),
-            "connected_at": datetime.now().isoformat(),
-        }
-        await manager.broadcast_to_admins({
-            "type": "agent_connected",
-            "agent_id": agent_id,
-            "metadata": manager.agent_metadata[agent_id],
-        })
-        return {"token": token.to_jwt()}
-    except ImportError as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "LiveKit API not installed", "detail": str(e)},
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Failed to generate token", "detail": str(e)},
-        )
 
 
 @app.get("/api/export/{disposition_type}")

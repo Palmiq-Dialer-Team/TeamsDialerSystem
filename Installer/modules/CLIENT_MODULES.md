@@ -17,16 +17,16 @@ Everything starts here: the UI, the wiring between components, and the core call
 - `DebugQueueDialog`, `SettingsDialog`, `CampaignDialog`, `FiltersDialog`
 - `TeamsPowerDialerApp`
 
-### Watch Out For
+### Watch out for
 
-- **COM init**: `sys.coinit_flags = 2` must run before any other imports or Excel COM will fail
-- **Streamer vs workers**: `StreamerWorker` only starts/stops *audio streaming*; the WebSocket connection is long-lived and started at app startup
+- COM init: `sys.coinit_flags = 2` must run before any other imports or Excel COM will fail.
+- Streamer vs workers: `StreamerWorker` only starts/stops audio streaming; the WebSocket connection is long-lived and started at app startup.
 
 ---
 
 ## 2. config.py (Installer root)
 
-Holds server URLs, audio settings, OneDrive path, and other constants. Paths, `SERVER_URL`, `SERVER_API_URL`, LiveKit (`USE_LIVEKIT`, `LIVEKIT_URL` — server IP/port 81). `_detect_onedrive_path()` for OneDrive folder.
+Holds server URLs, audio settings, OneDrive path, and other constants. Paths, `SERVER_URL`, `SERVER_API_URL`. `_detect_onedrive_path()` for OneDrive folder.
 
 ---
 
@@ -44,7 +44,7 @@ Checks for updates from the update server, downloads and extracts if newer, then
 |--------|---------|
 | `active_data_reader.py` | Excel COM → contacts; `load_data_shadow_copy`, `process_contacts` |
 | `audio_core.py` | Mic + loopback capture, 48 kHz stereo [mic, loopback] |
-| `streamer.py` | WebSocket to Backend; audio + JSON; force_hangup, callbacks |
+| `streamer.py` | WebSocket to Backend; audio + JSON; callbacks and dashboard audio (no server-side AMD) |
 | `teams_auto.py` | Teams dialing; pywinauto "Call" button, call window monitor |
 | `disposition_manager.py` | Save to source `_DISPO_STAMP` + per-disposition Excel files; autosave |
 | `campaign_manager.py` | FRESH/RECYCLE/TARGETED/ALL filter |
@@ -52,7 +52,7 @@ Checks for updates from the update server, downloads and extracts if newer, then
 | `settings_manager.py` | `user_settings.json` |
 | `session_manager.py` | `session_history.json` |
 | `data_handler.py` | Thin wrapper over reader (main.py uses reader directly) |
-| `livekit_streamer.py` | WebRTC audio when LiveKit enabled; token from `/api/livekit/token` |
+<!-- LiveKit-based streaming has been fully retired; audio uses only the WebSocket `AudioStreamer`. -->
 
 ---
 
@@ -61,6 +61,8 @@ Checks for updates from the update server, downloads and extracts if newer, then
 ```
 Excel → ActiveExcelReader → process_contacts → contact_list
 User clicks Call → TeamsController.start_call()
-Call starts → AudioWorker → audio_queue → StreamerWorker → AudioStreamer/LiveKitStreamer → Server
+Call starts → AudioWorker
+  ├─ loopback → AMDWorker (client-side AI: Silero VAD + faster-whisper) → human/voicemail/bot decision
+  └─ audio_queue → StreamerWorker → AudioStreamer → Server (for dashboard/monitoring only)
 Call ends → handle_disposition → DispositionSaver → source + Dispositions/*.xlsx
 ```

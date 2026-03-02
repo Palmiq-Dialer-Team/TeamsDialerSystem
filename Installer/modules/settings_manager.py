@@ -51,12 +51,18 @@ DEFAULT_SETTINGS = {
         "enabled": False,
         "agent_email": ""
     },
-    "livekit": {
-        "use_livekit": False,
-    },
     "excel": {
         "autosave_interval_minutes": 10,  # 0 = disabled, 5/10/15 options
     },
+    # UI preferences
+    "ui": {
+        "show_transcription_box": True,
+    },
+    # Nightly maintenance restart (configured via control panel)
+    "maintenance_restart_enabled": True,
+    "maintenance_restart_time": "19:00",  # 7 pm, server/local time
+    "maintenance_grace_period_seconds": 300,
+    "maintenance_last_run_date": None,
 }
 
 class SettingsManager:
@@ -178,15 +184,6 @@ class SettingsManager:
         }
         self.save_settings()
 
-    def get_livekit_settings(self):
-        """Returns LiveKit settings (use_livekit toggle)."""
-        return self.settings.get("livekit", DEFAULT_SETTINGS["livekit"]).copy()
-
-    def set_livekit_settings(self, use_livekit):
-        """Updates LiveKit setting."""
-        self.settings.setdefault("livekit", {})["use_livekit"] = bool(use_livekit)
-        self.save_settings()
-
     def get_excel_settings(self):
         """Returns Excel settings (autosave interval, etc.)."""
         return self.settings.get("excel", DEFAULT_SETTINGS["excel"]).copy()
@@ -194,4 +191,13 @@ class SettingsManager:
     def set_excel_settings(self, autosave_interval_minutes):
         """Updates Excel autosave interval (0=disabled)."""
         self.settings.setdefault("excel", {})["autosave_interval_minutes"] = int(autosave_interval_minutes)
+        self.save_settings()
+
+    def get_show_transcription_box(self) -> bool:
+        """Returns whether the real-time transcription box should be shown during calls."""
+        return self.settings.get("ui", DEFAULT_SETTINGS["ui"]).get("show_transcription_box", True)
+
+    def set_show_transcription_box(self, value: bool):
+        """Updates the UI preference for showing the real-time transcription box."""
+        self.settings.setdefault("ui", {})["show_transcription_box"] = bool(value)
         self.save_settings()

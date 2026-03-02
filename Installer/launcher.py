@@ -65,9 +65,13 @@ def check_for_updates():
     print("Checking for updates...")
     current_raw = load_local_version_raw()
     current = _parse_version_tuple(current_raw)
-    
+    headers = {"Connection": "keep-alive"}
+
     try:
-        resp = requests.get(f"{UPDATE_URL}/newversion.json", timeout=8, headers={"Connection": "keep-alive"})
+        # Prefer newversion.json; fall back to version.json for old servers or if this launcher was reverted by an old zip
+        resp = requests.get(f"{UPDATE_URL}/newversion.json", timeout=8, headers=headers)
+        if resp.status_code != 200:
+            resp = requests.get(f"{UPDATE_URL}/version.json", timeout=8, headers=headers)
         if resp.status_code != 200:
             print("Server unavailable. Skipping update.")
             return
@@ -97,13 +101,18 @@ def check_for_updates():
             
             os.remove("update.zip")
             print("Update Complete!")
-            
-            subprocess.call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
     except Exception as e:
         print(f"Update check failed: {e}")
 
+def ensure_dependencies():
+    """Run before every launch so deps (e.g. pip-system-certs) are installed before app/Whisper runs."""
+    if os.path.exists("requirements.txt"):
+        print("Ensuring dependencies (pip install -r requirements.txt)...")
+        subprocess.call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+
 if __name__ == "__main__":
     check_for_updates()
+    ensure_dependencies()
     print("Starting App...")
     subprocess.Popen([sys.executable, APP_ENTRY_POINT])
     sys.exit()

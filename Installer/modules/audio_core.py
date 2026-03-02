@@ -434,7 +434,8 @@ class AudioCapture:
         self.capture_thread.start()
 
         # Wait for streams to initialize (Smart Wait)
-        for _ in range(20):  # Wait up to 2.0 seconds
+        # INCREASED TIMEOUT: Windows WASAPI can be slow to initialize loopback
+        for _ in range(50):  # Wait up to 5.0 seconds
             if self.mic_stream and self.loopback_stream:
                 break
             time.sleep(0.1)

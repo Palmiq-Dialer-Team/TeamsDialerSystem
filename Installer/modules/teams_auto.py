@@ -8,7 +8,25 @@ import config
 from PyQt6.QtCore import QObject, pyqtSignal
 
 # Pywinauto imports
-from pywinauto import Desktop
+from pywinauto import Application, Desktop
+
+# Exceptions that occur when window becomes invalid (manual closure, etc.)
+try:
+    from pywinauto.findwindows import ElementNotFoundError
+except ImportError:
+    ElementNotFoundError = Exception
+try:
+    from pythoncom import com_error as COMError
+except ImportError:
+    COMError = Exception
+
+# Win32 API for forceful window close (part of pywin32, available with pywinauto)
+try:
+    import win32gui
+    import win32con
+except ImportError:
+    win32gui = None
+    win32con = None
 
 
 class TeamsController(QObject):
@@ -16,6 +34,10 @@ class TeamsController(QObject):
     
     call_ended_signal = pyqtSignal()
     call_started_signal = pyqtSignal()
+    # Emitted once when the in-call timer first appears (actual connection time)
+    call_connected_signal = pyqtSignal()
+    # Emitted when Teams shows a connection/recording failure (e.g. "We couldn't connect you")
+    call_failed_signal = pyqtSignal()
     
     def __init__(self):
         super().__init__()
@@ -23,6 +45,9 @@ class TeamsController(QObject):
         self.monitor_thread = None
         self.monitoring = False
         self.baseline_windows = None
+        self.current_call_handle = None
+        # Tracks whether we've already emitted call_connected_signal for the active call
+        self._connected_emitted = False
     
     def start_call(self, phone_number: str) -> bool:
         try:
@@ -215,6 +240,9 @@ class TeamsController(QObject):
         """
         def monitor_loop():
             self.monitoring = True
+            self.current_call_handle = None
+            # Reset connection flag for each new monitoring session
+            self._connected_emitted = False
             desktop = Desktop(backend="uia")
             
             # Step 1: Use baseline windows captured in start_call (before button was pressed)
@@ -254,6 +282,7 @@ class TeamsController(QObject):
                                 
                                 if not is_chat_window:
                                     call_window = w
+                                    self.current_call_handle = handle
                                     print(f"[TeamsController] [MONITOR] ✓ Found NEW Teams window (call window): '{title}' (handle: {handle})")
                                     break
                                 else:
@@ -290,8 +319,8 @@ class TeamsController(QObject):
                         try:
                             current_title = call_window.window_text()
                             exists_result = True
-                        except Exception as e1:
-                            print(f"[TeamsController] [MONITOR] Check #{check_count}: Cannot read window text: {e1}")
+                        except (ElementNotFoundError, COMError, Exception) as e1:
+                            print(f"[TeamsController] [MONITOR] Manual closure detected (check #{check_count}): {e1}")
                             exists_result = False
                         
                         # Method 2: Verify window handle is still in the current Teams windows list
@@ -315,13 +344,13 @@ class TeamsController(QObject):
                                             pass
                                     
                                     if not found_in_list:
-                                        print(f"[TeamsController] [MONITOR] Check #{check_count}: ✗ Window handle {handle} NOT found in current Teams windows - window closed!")
+                                        print(f"[TeamsController] [MONITOR] Manual closure detected (check #{check_count}): window closed")
                                         exists_result = False
                                 else:
                                     if check_count % 10 == 0:
                                         print(f"[TeamsController] [MONITOR] Check #{check_count}: Warning - window has no handle attribute")
-                            except Exception as e2:
-                                print(f"[TeamsController] [MONITOR] Check #{check_count}: Error verifying window handle: {e2}")
+                            except (ElementNotFoundError, COMError, Exception) as e2:
+                                print(f"[TeamsController] [MONITOR] Manual closure detected (check #{check_count}): {e2}")
                                 # If we can't verify, assume it still exists (conservative)
                                 exists_result = True
                         
@@ -347,31 +376,65 @@ class TeamsController(QObject):
                                     text_elems = call_window.descendants(control_type="Text")
                                     for text_elem in text_elems:
                                         try:
-                                            text_content = text_elem.window_text()
+                                            text_content = text_elem.window_text() or ""
+                                            # Timer text
                                             if re.match(r'^\d{2}:\d{2}$', text_content):
                                                 time_str = text_content
                                                 if check_count % 10 == 0:
                                                     print(f"[TeamsController] [MONITOR] Check #{check_count}: Window exists, timer='{time_str}' (from Text element), title='{current_title}'")
-                                                break
                                         except Exception:
                                             continue
-                                except Exception as e:
+                                except (ElementNotFoundError, COMError, Exception) as e:
                                     if check_count % 10 == 0:
-                                        print(f"[TeamsController] [MONITOR] Check #{check_count}: Window exists but error extracting timer: {e}, title='{current_title}'")
-                        except Exception as e:
-                            if check_count % 10 == 0:
-                                print(f"[TeamsController] [MONITOR] Check #{check_count}: Error reading window text: {e}")
+                                        print(f"[TeamsController] [MONITOR] Check #{check_count}: Window exists but error extracting timer/text: {e}, title='{current_title}'")
+
+                            # If we still don't see a running timer (00:00), scan for connection/recording failure UI.
+                            if time_str == "00:00":
+                                try:
+                                    # Find any Dismiss button first (narrow search to buttons).
+                                    dismiss_buttons = call_window.descendants(control_type="Button", title="Dismiss")
+                                    if dismiss_buttons:
+                                        # Confirm the same window contains failure-related text.
+                                        texts = call_window.descendants(control_type="Text")
+                                        combined = " ".join(
+                                            (t.window_text() or "").lower()
+                                            for t in texts
+                                        )
+                                        if "connect" in combined or "recording" in combined:
+                                            print("[TeamsController] [MONITOR] Connection failure detected in window. Clicking Dismiss.")
+                                            try:
+                                                dismiss_buttons[0].invoke()
+                                                print("[TeamsController] [MONITOR] Dismiss button invoked.")
+                                            except Exception as click_err:
+                                                print(f"[TeamsController] [MONITOR] Error clicking 'Dismiss': {click_err}")
+                                            # Signal failure and stop monitoring; cleanup will run after loop.
+                                            self.monitoring = False
+                                            self.call_failed_signal.emit()
+                                            break
+                                except (ElementNotFoundError, COMError, Exception) as e:
+                                    if check_count % 10 == 0:
+                                        print(f"[TeamsController] [MONITOR] Failure scan error: {e}")
+
+                        except (ElementNotFoundError, COMError, Exception) as e:
+                            print(f"[TeamsController] [MONITOR] Manual closure detected (check #{check_count}): {e}")
+                            exists_result = False
                         
+                        if not exists_result or not self.monitoring:
+                            break
+
+                        # Fire call_connected_signal once when the in-call timer first becomes visible
+                        if not self._connected_emitted and time_str and time_str != "00:00":
+                            self._connected_emitted = True
+                            print(f"[TeamsController] [MONITOR] Detected call connection at timer='{time_str}' -> emitting call_connected_signal")
+                            self.call_connected_signal.emit()
+
                         if timer_callback:
                             timer_callback(time_str)
                         
                         time.sleep(1.0)
-                    except Exception as e:
-                        # If window reference becomes stale, assume call ended
-                        print(f"[TeamsController] [MONITOR] ✗ Exception checking window (check #{check_count}): {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Assume call ended if we can't check the window
+                    except (ElementNotFoundError, COMError, Exception) as e:
+                        # Window handle invalid (manual closure) or any pywinauto/COM error
+                        print(f"[TeamsController] [MONITOR] Manual closure detected (check #{check_count}): {e}")
                         break
             else:
                 print(f"[TeamsController] [MONITOR] ✗ Could not find new call window after {max_discovery_attempts} attempts")
@@ -379,6 +442,7 @@ class TeamsController(QObject):
             # Cleanup
             print("[TeamsController] [MONITOR] Monitoring loop ending, cleaning up...")
             self.monitoring = False
+            self.current_call_handle = None
             if on_ended_callback:
                 print("[TeamsController] [MONITOR] Calling on_ended_callback...")
                 on_ended_callback()
@@ -397,123 +461,72 @@ class TeamsController(QObject):
     
     def hang_up(self) -> bool:
         """
-        Hang up the current call using UIA Pattern Invoke.
-        Targets 'ToolBar': 'Calling controls' -> 'Button': 'Leave'
-        Works even if window is in background or minimized.
+        Hang up the current call by targeting the cached call window handle.
+        Attempt 1: UIA Leave button invoke (polite)
+        Attempt 2: window.close() (forceful)
+        Attempt 3: WM_CLOSE via win32 (nuclear)
+        No pyautogui; catches all exceptions to avoid crashing the main app.
         """
-        print("[TeamsController] Attempting UIA Hangup via 'Calling controls' > 'Leave'...")
         try:
-            desktop = Desktop(backend="uia")
+            handle = getattr(self, "current_call_handle", None)
+            if handle is None:
+                print("[TeamsController] Hangup skipped: no call window handle cached.")
+                return False
+
+            print(f"[TeamsController] Hangup targeting window handle {handle}...")
             hung_up = False
-            
-            # Find all visible Teams windows
+
+            # Attempt 1 (Polite): UIA Leave button
             try:
-                windows = desktop.windows(title_re=".*Microsoft Teams.*", visible_only=True)
-            except Exception as e:
-                print(f"[TeamsController] Error listing windows: {e}")
-                windows = []
-
-            for w in windows:
-                try:
-                    # Search specifically for the 'Calling controls' ToolBar.
-                    # This exists in both Main Window (as a nested child) and Compact View.
-                    # Using descendants ensures we find it regardless of tree depth.
+                app = Application(backend="uia").connect(handle=handle)
+                w = app.window(handle=handle)
+                if w.exists(timeout=1):
                     toolbars = w.descendants(control_type="ToolBar", title="Calling controls")
-                    
-                    if not toolbars:
-                        continue
-                        
                     for tb in toolbars:
-                        # Inside the toolbar, look for the 'Leave' button
                         try:
-                            # 'Leave' should be a direct child of the toolbar
                             leave_btn = tb.child_window(control_type="Button", title="Leave")
-                            
-                            if leave_btn.exists():
-                                print(f"[TeamsController] Found 'Leave' button in window: '{w.window_text()}'")
-                                
-                                # METHOD 1: Invoke Pattern (Best for background/unfocused windows)
-                                try:
-                                    leave_btn.invoke()
-                                    print("[TeamsController] Successfully invoked 'Leave' button.")
-                                    hung_up = True
-                                except Exception as e_invoke:
-                                    print(f"[TeamsController] Invoke failed: {e_invoke}. Trying click_input...")
-                                    
-                                    # METHOD 2: Physical Click (Fallback)
-                                    try:
-                                        # Only works if visible, so we ensure focus first
-                                        w.set_focus()
-                                        leave_btn.click_input()
-                                        print("[TeamsController] Clicked 'Leave' button.")
-                                        hung_up = True
-                                    except Exception as e_click:
-                                        print(f"[TeamsController] Click failed: {e_click}")
-
-                                if hung_up:
-                                    break
+                            if leave_btn.exists(timeout=0.5):
+                                leave_btn.invoke()
+                                print("[TeamsController] Hangup: Leave button invoked (method: UIA)")
+                                hung_up = True
+                                break
                         except Exception:
                             continue
-                    
-                    if hung_up:
-                        break
+            except Exception as e1:
+                print(f"[TeamsController] Hangup attempt 1 (Leave button) failed: {e1}")
 
-                except Exception as e:
-                    print(f"[TeamsController] Error processing window for hangup: {e}")
-                    continue
-
-            # FALLBACK: Keyboard Shortcut (Ctrl+Shift+H)
-            # Only used if UIA search failed to find/click the button
+            # Attempt 2 (Forceful): window.close()
             if not hung_up:
-                print("[TeamsController] UIA Hangup failed. Attempting Ctrl+Shift+H fallback...")
-                import pyautogui
-                
-                # Try to focus the most likely call window
-                active_call_found = False
-                for w in windows:
-                    title = w.window_text()
-                    # Look for timer in title (e.g., "00:45 | ...") or "Meeting compact view"
-                    if re.search(r'\d{2}:\d{2}', title) or "Meeting compact view" in title:
-                        try:
-                            w.set_focus()
-                            active_call_found = True
-                            time.sleep(0.1)
-                            pyautogui.hotkey('ctrl', 'shift', 'h')
-                            print(f"[TeamsController] Sent Ctrl+Shift+H to: {title}")
-                            hung_up = True
-                            break
-                        except Exception:
-                            continue
-                
-                if not active_call_found and windows:
-                    # If we couldn't identify a specific call window, try the first Teams window
-                    try:
-                        windows[0].set_focus()
-                        time.sleep(0.1)
-                        pyautogui.hotkey('ctrl', 'shift', 'h')
-                        print("[TeamsController] Sent Ctrl+Shift+H to primary Teams window.")
+                try:
+                    app = Application(backend="uia").connect(handle=handle)
+                    w = app.window(handle=handle)
+                    if w.exists(timeout=1):
+                        w.close()
+                        print("[TeamsController] Hangup: window.close() (method: forceful)")
                         hung_up = True
-                    except Exception:
-                        pass
+                except Exception as e2:
+                    print(f"[TeamsController] Hangup attempt 2 (close) failed: {e2}")
+
+            # Attempt 3 (Nuclear): WM_CLOSE
+            if not hung_up and win32gui is not None and win32con is not None:
+                try:
+                    if win32gui.IsWindow(handle):
+                        win32gui.PostMessage(handle, win32con.WM_CLOSE, 0, 0)
+                        print("[TeamsController] Hangup: WM_CLOSE sent (method: nuclear)")
+                        hung_up = True
+                except Exception as e3:
+                    print(f"[TeamsController] Hangup attempt 3 (WM_CLOSE) failed: {e3}")
 
             if hung_up:
-                # Wait for call window to close (up to 4 seconds) so next call can start cleanly
                 for _ in range(20):
                     time.sleep(0.2)
                     try:
-                        still_calling = False
-                        # Quick check if any window still has a timer
-                        current_wins = desktop.windows(title_re=".*Microsoft Teams.*")
-                        for w in current_wins:
-                            if re.search(r'\d{2}:\d{2}', w.window_text() or ""):
-                                still_calling = True
-                                break
-                        if not still_calling:
+                        if win32gui and not win32gui.IsWindow(handle):
                             break
                     except Exception:
                         break
 
-            return True
+            return hung_up
         except Exception as e:
             print(f"[TeamsController] Critical Hangup Error: {e}")
             return False

@@ -219,7 +219,13 @@ class ActiveExcelReader:
             'Notes': ['notes']
         }
 
+        # Optional per-row metadata columns
         dispo_col = next((c for c in df.columns if 'disposition stamp' in str(c).lower()), None)
+        # Exact header for LinkedIn profile URL
+        linkedin_col = next(
+            (c for c in df.columns if str(c).strip().lower() == "contact li profile url"),
+            None,
+        )
 
         for idx, row in df.iterrows():
             try:
@@ -241,6 +247,14 @@ class ActiveExcelReader:
                         if pd.notna(val) and str(val).strip():
                             emails.append(str(val).strip())
                 contact['Emails'] = emails
+
+                # LinkedIn profile URL (exact header: "Contact LI Profile URL")
+                if linkedin_col:
+                    val = row[linkedin_col]
+                    if pd.notna(val):
+                        url = str(val).strip()
+                        if url:
+                            contact["LinkedIn"] = url
 
                 phones = []
                 for col in df.columns:

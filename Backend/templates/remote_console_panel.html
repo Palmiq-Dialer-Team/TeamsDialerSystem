@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Remote Console</title>
+    <style>
+        body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+        h1 { font-size: 1.4rem; margin-bottom: 16px; }
+        .actions { margin-bottom: 16px; display: flex; gap: 8px; }
+        button { padding: 8px 14px; border-radius: 0; border: 1px solid #444; cursor: pointer; font-weight: 600; background: #1f1f1f; color: #eee; }
+        button:hover { background: #2d2d2d; color: #fff; }
+        .log-container { background: #1f1f1f; border-radius: 0; padding: 8px; max-height: 70vh; overflow-y: auto; font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; border: 1px solid #333; }
+        .status { font-size: 0.9rem; color: #ccc; margin-bottom: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Remote Console</h1>
+    <div class="status">Authenticated. Use with care.</div>
+    <div class="actions">
+        <form method="post" action="/remote-console/shutdown" onsubmit="return confirm('Shut down server now? Existing connections will be drained.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn-shutdown">Shutdown Server</button>
+        </form>
+        <form method="post" action="/remote-console/restart" onsubmit="return confirm('Restart server now? Existing connections will be drained.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn-restart">Restart Server</button>
+        </form>
+    </div>
+    <div class="status">Recent logs:</div>
+    <div id="log-container" class="log-container">Loading logs...</div>
+
+    <script>
+        async function loadLogs() {
+            try {
+                const res = await fetch('/remote-console/logs?lines=200', { cache: 'no-store' });
+                if (!res.ok) {
+                    document.getElementById('log-container').textContent = 'Unable to load logs (' + res.status + ').';
+                    return;
+                }
+                const data = await res.json();
+                const lines = data.lines || [];
+                document.getElementById('log-container').textContent = lines.join('');
+            } catch (e) {
+                document.getElementById('log-container').textContent = 'Error loading logs: ' + e;
+            }
+        }
+
+        loadLogs();
+        setInterval(loadLogs, 5000);
+    </script>
+</body>
+</html>
+

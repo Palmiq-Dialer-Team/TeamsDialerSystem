@@ -15,4 +15,7 @@ pytz
 requests
 pyautogui
 uiautomation
-livekit
+torch
+torchaudio
+faster-whisper
+pip-system-certs

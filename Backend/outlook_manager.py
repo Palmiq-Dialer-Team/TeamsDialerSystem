@@ -28,6 +28,86 @@ AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}" if TENANT_ID else "
 ENDPOINT = f"https://graph.microsoft.com/v1.0/users/{ORGANIZER_EMAIL}/events" if ORGANIZER_EMAIL else ""
 SCOPES = ["https://graph.microsoft.com/.default"]
 
+def _safe_get(data: dict, key: str, default: str = "N/A"):
+    """Get value from dict; return default if missing, empty, or not a string/number."""
+    if data is None:
+        return default
+    val = data.get(key)
+    if val is None or (isinstance(val, str) and not val.strip()):
+        return default
+    return str(val).strip() if val else default
+
+
+def _format_callback_event(contact_data_dict, notes="", source_workbook_path=None, source_sheet_name=None):
+    """
+    Build Outlook event subject and body from full contact metadata.
+    Subject uses name + company; body includes the entire contact_data row (all columns).
+    Returns (subject, body_html).
+    """
+    if not isinstance(contact_data_dict, dict):
+        contact_data_dict = {}
+    first = _safe_get(contact_data_dict, "First Name", "N/A")
+    last = _safe_get(contact_data_dict, "Last Name", "N/A")
+    contact_name = f"{first} {last}".strip() or "N/A"
+    company = _safe_get(contact_data_dict, "Company", "N/A")
+
+    subject = f"Callback: {contact_name} ({company})"
+
+    # Optional reminder notes (from the callback, not the row)
+    notes_line = ""
+    if (notes or "").strip():
+        notes_line = f'<p><b>Reminder notes:</b> {_html_escape((notes or "").strip())}</p>'
+
+    # Source folder line if we have it
+    sheet = (source_sheet_name or contact_data_dict.get("sheetName") or "").strip() or "N/A"
+    workbook = (source_workbook_path or contact_data_dict.get("workbook_path") or "").strip()
+    if workbook:
+        source_folder = f"{sheet} ({os.path.basename(workbook)})"
+    else:
+        source_folder = sheet
+    source_line = f'<p><b>Source:</b> {_html_escape(source_folder)}</p>' if source_folder and source_folder != "N/A" else ""
+
+    # Full contact_data row: every key/value from the database (title, company, phones, etc.)
+    rows_html = []
+    for key, val in sorted(contact_data_dict.items()):
+        display_val = _format_contact_value(val)
+        rows_html.append(f"<tr><td style=\"vertical-align:top;padding:2px 8px 2px 0;\"><b>{_html_escape(key)}:</b></td><td style=\"padding:2px 0;\">{display_val if display_val else '<i>—</i>'}</td></tr>")
+
+    table = f"<table>{''.join(rows_html)}</table>" if rows_html else "<p><i>No contact fields</i></p>"
+
+    body = f"""
+    <h3>Callback Reminder</h3>
+    {notes_line}
+    {source_line}
+    <h4>Contact (full row)</h4>
+    {table}
+    """
+    return subject, body
+
+
+def _html_escape(s: str) -> str:
+    """Escape for HTML content."""
+    if not isinstance(s, str):
+        s = str(s)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _format_contact_value(val) -> str:
+    """Format a contact_data value for HTML (list -> comma-separated, else string)."""
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        parts = []
+        for item in val:
+            if item is not None and str(item).strip():
+                parts.append(str(item).strip())
+        return _html_escape(", ".join(parts)) if parts else ""
+    if isinstance(val, dict):
+        return _html_escape(json.dumps(val))
+    s = str(val).strip()
+    return _html_escape(s) if s else ""
+
+
 # Map simplified timezones to Windows Timezone IDs required by Graph API
 TZ_MAPPING = {
     "ET": "Eastern Standard Time",
@@ -47,6 +127,11 @@ TZ_MAPPING = {
 
 
 class OutlookManager:
+    @staticmethod
+    def format_callback_event(contact_data_dict, notes="", source_workbook_path=None, source_sheet_name=None):
+        """Build Outlook event subject and body from contact metadata. Returns (subject, body_html)."""
+        return _format_callback_event(contact_data_dict, notes, source_workbook_path, source_sheet_name)
+
     def __init__(self):
         if not all([CLIENT_ID, TENANT_ID, CLIENT_SECRET, ORGANIZER_EMAIL]):
             print("Outlook Manager: Missing Azure credentials. Set AZURE_CLIENT_ID, AZURE_TENANT_ID, "

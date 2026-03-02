@@ -86,8 +86,12 @@
     <div class="main">
         <div class="header">
             <h1>📞 Live Operations Floor</h1>
-            <div id="connection-status" style="color: #888;">Connecting to server...</div>
+            <div id="connection-status" style="color: #888;">
+                <a href="/remote-console/login" title="Remote console (password protected)" style="text-decoration: none;">🟢</a>
+                <span id="connection-status-text">Connecting to server...</span>
+            </div>
         </div>
+        <a href="/audio-test" title="Audio testing (Opus / test client)" style="position: fixed; top: 12px; right: 12px; font-size: 1.5rem; text-decoration: none; z-index: 100;">🐛</a>
         
         <div id="agents-grid" class="agent-grid">
             <!-- Agent Cards injected here via JS -->
@@ -156,11 +160,21 @@
 
         ws.onopen = () => {
             console.log("WS Connected");
-            document.getElementById('connection-status').innerText = "🟢 System Online";
+            const statusEl = document.getElementById('connection-status-text');
+            if (statusEl) {
+                statusEl.innerText = "System Online";
+            } else {
+                document.getElementById('connection-status').innerText = "🟢 System Online";
+            }
             ws.send(JSON.stringify({ type: "get_full_list" }));
         };
         ws.onclose = () => {
-            document.getElementById('connection-status').innerText = "🔴 Disconnected";
+            const statusEl = document.getElementById('connection-status-text');
+            if (statusEl) {
+                statusEl.innerText = "Disconnected";
+            } else {
+                document.getElementById('connection-status').innerText = "🔴 Disconnected";
+            }
         };
 
         ws.onmessage = async function(event) {

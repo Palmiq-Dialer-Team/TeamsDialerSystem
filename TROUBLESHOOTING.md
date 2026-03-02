@@ -36,23 +36,24 @@ INFO:     connection open
 ---
 
 ## Issues agents may report – self‑help
+---
 
-### Calls timing out, hanging up on their own, or advancing to next number without clicking
+### Voicemail wasn’t skipped, or a real person was hung up on (Auto-Call / AMD)
 
 #### What you see
 
-- Calls end by themselves after a short time.
-- Dialer moves to the next number without the agent clicking “Next” or similar.
+- With **Start Auto-Call** on: the dialer **didn’t** hang up on a voicemail (user had to skip manually), or it **did** hang up on a real person (false positive).
 
 #### What it means
 
-- The **autocall** (auto-advance / experimental) feature is likely **turned on**. That behavior is expected when it’s enabled.
+- The **client-side AI** (Silero VAD + faster-whisper) decides hang up vs keep-call by matching the **transcript** against phrase lists (voicemail, bot, invalid number, human greetings). If a phrase is missing or too generic, you get the wrong behavior.
 
 #### What to do
 
-- Open the **config** (gear/cog) → **Calling**.
-- **Deactivate** the autocall / auto-advance check (the option that controls calling the next number automatically).
-- If they want that behavior, they can turn it back on knowing it’s still experimental.
+- See **`Installer/modules/CLIENT_SIDE_AI.md`** for:
+  - **How the logic works** (phrase lists, order of checks, libraries).
+  - **How to add more phrases** (e.g. “user reported this voicemail wasn’t skipped” → add that phrase to `VOICEMAIL_PHRASES`).
+  - **Common errors and fixes** (voicemail not skipped, human hung up, Whisper/VAD issues).
 
 ---
 

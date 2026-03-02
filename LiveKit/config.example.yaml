@@ -1,8 +1,0 @@
-# Example LiveKit server config – copy to config.yaml and fill in keys.
-port: 81
-rtc:
-  node_ip: 0.0.0.0
-  udp_port: 3478
-keys:
-  devkey: YOUR_LIVEKIT_API_KEY
-  secret: YOUR_LIVEKIT_API_SECRET

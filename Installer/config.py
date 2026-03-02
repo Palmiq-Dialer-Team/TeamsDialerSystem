@@ -4,8 +4,6 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
-CLIENT_DIR = BASE_DIR / "Client_App"
-ASSETS_DIR = CLIENT_DIR / "assets"
 
 
 def _detect_onedrive_path():
@@ -51,10 +49,6 @@ SYSTEM_AUDIO_MULTIPLIER = 6.0
 
 SERVER_URL = "ws://192.168.1.46/ws"
 SERVER_API_URL = "http://192.168.1.46"
-
-# LiveKit server IP/port (UDP in LiveKit config.yaml)
-USE_LIVEKIT = False
-LIVEKIT_URL = "ws://192.168.1.46:81"
 
 UPDATE_INTERVAL = 100
 

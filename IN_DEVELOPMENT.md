@@ -1,42 +1,51 @@
-# In development / roadmap
+# In progress / roadmap
 
-Items still being fixed or planned. Not yet completed.
-
----
-
-## 1. LiveKit audio transmission (cleaner path for transcription)
-
-**Goal:** Use LiveKit for audio streaming instead of (or in addition to) pure WebSockets, so the server gets a cleaner audio stream and transcription (e.g. AMD / faster-whisper) can be more accurate.
-
-**Current status:** Still in setup. **Firewall is dropping connections** (LiveKit uses different ports/protocols than plain HTTP/WS), so we’re working through network/firewall configuration before this can be the primary path.
-
-**When done:** Expect more reliable, higher-quality audio for AMD and any future transcription features.
+Current phase: v2.0.0 with client-side AI is in production. We are mainly refining phrase patterns and small interactions (for example, missing voicemail or invalid-number phrases) based on real-world usage.
 
 ---
 
-## 2. TTS for autocall (after LiveKit + autocall work)
+## 1. Client-side AI (v2.0.0)
 
-**Goal:** Once LiveKit audio and autocall work as intended with transcription, add **text-to-speech (TTS)** for the client so agents hear short announcements during autocall, e.g. *“Now calling [person name]…”*, so they don’t get lost and the flow is more user-friendly.
+Status: In production, under ongoing tuning.
 
-**Current status:** Planned; depends on (1) being stable and autocall + transcription behaving correctly.
+- Client-side AMD is the only AMD path: the Installer runs Silero VAD + faster-whisper locally when Start Auto-Call is on. The server does not perform any audio analysis; it only receives metadata, dispositions, callbacks, and (optionally) audio for dashboards.
+- The 35s / 50s no-answer timer, voicemail / bot / invalid-number detection, and auto-advance (next number / next contact) are all driven by the client.
+- Most current work is focused on small improvements: adding missing voicemail / bot / invalid-number phrases, adjusting ambiguous-speech thresholds, and improving autocall arbitration in edge cases.
 
 ---
 
-## 3. New-user / first-run experience
+## 2. LiveKit audio (optional / experimental)
 
-**Goal:** Improve onboarding for first install or first use of the app:
+Goal: Use LiveKit for WebRTC audio as an alternative to the raw WebSocket stream (for future features or environments where WebRTC is preferred).
 
-- **Quick lookaround:** A short guided tour with small popups or hints pointing to main areas: *“Click here for config”*, *“Click here for filtering”*, etc., so new users see what does what.
-- **Optional test Excel:** Ship or offer a **sample/test .xlsx** so users can try filtering, importing, and calling flow without using real leads. They can get used to how the app works in a safe way.
+Current status: Optional. The production dialer uses client-side AI and the standard WebSocket audio path, so LiveKit is not required for AMD. It remains available for experimentation but is not on the critical path.
 
-**Current status:** Idea / planned; not yet implemented.
+---
+
+## 3. TTS for autocall (future)
+
+Goal: Add text-to-speech (TTS) on the client so agents hear short announcements during autocall, for example “Now calling [person name]…”.
+
+Current status: Planned; depends on autocall + client-side transcription being stable in production. No dependency on LiveKit.
+
+---
+
+## 4. New-user / first-run experience (future)
+
+Goal: Improve onboarding:
+
+- Short guided tour or hints (for example, “Click here for config”, “Here for filtering”).
+- Optional sample/test `.xlsx` so users can try the app without real leads.
+
+Current status: Idea / planned; not yet implemented.
 
 ---
 
 ## Summary
 
-| Area | Status | Blocker / dependency |
-|------|--------|----------------------|
-| LiveKit audio for cleaner transmission | In setup | Firewall dropping LiveKit connections |
-| TTS (“Now calling…”) for autocall | Planned | LiveKit audio + autocall with transcription working |
+| Area | Status | Notes |
+|------|--------|-------|
+| v2.0.0 client-side AI | In production; tuning | Silero VAD + faster-whisper on Installer; Auto-Call, 35s/50s timer, auto-advance; now mainly refining phrase lists and edge cases |
+| LiveKit audio | Optional / experimental | Not required for production AMD |
+| TTS (“Now calling…”) for autocall | Planned | After 2.0.0 is fully stable |
 | First-run tour + test xlsx | Planned | — |

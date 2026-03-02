@@ -4,6 +4,43 @@ Documentation of program status, fixes, and addons by version.
 
 > **Full project overview**: See `PROJECT_OVERVIEW.md` for architecture, technical flow, module roles, and recent changes.
 
+**Version numbering:** From version **1.9.9** onward we use **x.y.z** (e.g. 1.9.11, 1.9.12). Major version **2.0.0** marks the switch to client-side AI (see below). Earlier entries keep the previous numbering for history.
+
+---
+
+## Version 2.0.0
+
+### Status
+- Client-side AI is implemented: Answering Machine Detection (AMD) now runs on the Installer client instead of the server. The client processes audio locally with Silero VAD + faster-whisper and no longer streams audio to the server for AMD (metadata and call_started are still sent when using Auto-Call).
+- Backend continues to serve dashboard, dispositions, callbacks, and WebSocket. It no longer needs to run AMD for the production dialer; any server-side AMD code is considered legacy.
+- File version numbers (for example `WebUpdates/newversion.json`, `version.json`) may still show 1.9.x on some deployments; bump to 2.0.0 in those files when you ship the final release.
+
+### Major changes
+
+Client-side AMD (Installer)
+- `Installer/modules/ai_core.py`: Silero VAD + faster-whisper (tiny.en, float32); VAD grace period; buffered speech with early transcription after silence; intent detection (voicemail, bot_screening, invalid_number) and human-greeting logic; persistence so repeated empty/ambiguous results can be treated as human after several events.
+- AMDWorker (QThread): Consumes loopback-only float32 from a dedicated queue; runs `process_chunk` and `analyze_buffered_audio`; emits `human_detected_signal`, `force_hangup_signal`, `transcription_update_signal`, `continue_result_signal`.
+- AudioWorker: Optionally feeds an `amd_queue` with the loopback channel as float32 for AMD; main audio queue is still used for the streamer when not in dry-run.
+- 35s / 50s no-answer timer: Single-shot 35s on call start when Auto-Call + AMD are active; on AMD "continue" (ambiguous/empty) the timer can be extended once to 50s from call start.
+- Transcription UI: In-call read-only text area shows VAD / transcription / analysis messages when Auto-Call is active; hidden when the call ends.
+
+Auto-Call mode
+- Start Auto-Call button toggles `is_autocalling_active`. When on, clicking Call starts a call and local AMD runs; human detected → stop AI and timer; voicemail / timeout / invalid_number / bot → `handle_local_hangup` (disposition Wrong Number or No Response, hang up, stop threads, then `_no_answer_automation_timer` to try the next number or the next contact and `start_call()`).
+- Arbitrator (`on_call_ended`): Invalid-number phrase in last transcript → Wrong Number; autocall + confirmed human → pause for disposition ("Waiting for Disposition..."); short call (<10s) with autocall → safe stop (toggle autocall off); otherwise → auto-next after a short delay.
+- `handle_force_hangup`: Ignored when `_using_local_ai_this_call`; server-driven hangups are still supported for non–Auto-Call or legacy clients.
+
+TeamsController (Installer)
+- `call_connected_signal`: Emitted once when the in-call timer first appears (not 00:00), used to set `actual_start_time` for duration and safety logic.
+- `current_call_handle`: Cached when the call window is discovered; `hang_up()` targets that handle (UIA Leave → window.close() → WM_CLOSE via win32), no pyautogui.
+- `on_ended_callback=None` in the monitor so cleanup is done from the main thread in `on_call_ended`.
+
+Dependencies (Installer)
+- Added: `torch`, `torchaudio`, `faster-whisper` (see `Installer/requirements.txt`).
+
+Optional
+- `DRY_RUN_CLIENT_AI`: If set to `True`, client-side AI runs and shows predictions in the transcription box but does not hang up and does not start the streamer (no audio is sent to the server).
+- Launcher: Version check prefers `newversion.json`, falls back to `version.json` (see launcher/version flow in earlier notes).
+
 ---
 
 ## Version 1.57
@@ -102,19 +139,6 @@ Documentation of program status, fixes, and addons by version.
 
 ---
 
-## Version 1.62 (Current)
-
-### Disposition / calls table – NULL id fix (export “only up to a date”)
-- **Cause:** Under load, a race in the SQLite driver could leave some call rows with NULL `id`, breaking dashboard export from that point on.
-- **Prevention:**
-  - **log_disposition** now uses `INSERT ... RETURNING id` (SQLite 3.35+) so the inserted id is read atomically; fallback to `lastrowid` on older SQLite.
-  - **WAL mode** enabled in `init_db()`: `PRAGMA journal_mode=WAL` for better concurrency when multiple agents save dispositions.
-- **Runtime healing:** After each disposition save, the server runs `fix_null_call_ids()` to repair any rows with NULL id (so export recovers without restart).
-- **One-time schema fix:** If the DB already has bad rows, run **`Backend/cleandb/fix_db_schema.py`** with the server **stopped** (or use `run_fix_db_schema.bat`). It renames `calls` → `calls_backup`, creates a fresh `calls` table with correct AUTOINCREMENT, copies data (assigning new ids where id was NULL), recreates indexes, and enables WAL. Keeps `calls_backup` for safety.
-- **Docs:** `Backend/docs/NULL_ID_ISSUE_REPORT.md`, `Backend/docs/DISPOSITION_SAVE_ANALYSIS.md`; TROUBLESHOOTING.md updated with steps.
-
----
-
 ## Version 1.61
 
 ### Diagnostic Logging (Server)
@@ -181,4 +205,124 @@ Documentation of program status, fixes, and addons by version.
 **If mic/loopback sounds wrong (low pitch, choppy)**: Re-apply the stereo fix—open device with `channels=2` when `maxInputChannels >= 2`, then downmix to mono before processing.
 
 ---
+
+
+## Version 1.62 till 1.85
+- Bug fixes and stability improvements across Backend and Installer.
+- Minor UI tweaks and export behavior adjustments.
+
+---
+
+## Version 1.86 till 1.9
+- Improvements to WebSocket reconnection and error handling.
+- Control panel and dashboard small fixes.
+
+---
+
+## Version 1.91 till 1.93
+- Features: Queue Status / Debug in Control Panel and Installer (agent list, async tasks, queue clearing).
+- Diagnostic logging on server (call_started, audio packets, call ended).
+
+---
+
+## Version 1.94
+- DB viewer pagination (Prev/Next, 500 rows per page).
+- Graceful server shutdown via Control Panel; explicit startup order (lifespan).
+
+---
+
+## Version 1.95
+- Bug fix: mic audio for stereo USB headsets (low pitch / choppy) – open as stereo then downmix to mono.
+- Audio Capture (DO NOT BREAK) behavior documented.
+
+---
+
+## Version 1.96
+- Announcement system: Control panel sends message + optional image to all agents; Installer shows popup.
+
+---
+
+## Version 1.97
+- Bug fixes and improvements to disposition flow and Excel sync.
+- Tweaks to AMD timeout and VAD logging.
+
+---
+
+## Version 1.98
+- Export and dashboard improvements; agent filter and stats refresh.
+- Minor backend and installer stability fixes.
+
+---
+
+## Version 1.9.9
+- Documentation and run instructions (RUN.md, PROJECT_OVERVIEW, TROUBLESHOOTING).
+- Setup and control panel build notes; version numbering aligned to x.y.z.
+
+---
+
+## Version 1.9.10
+- Bug fixes and preparation for disposition/DB robustness (NULL id handling, WAL).
+- Clean DB tools and fix_db_schema script.
+
+---
+
+## Version 1.9.11 (Current)
+
+### Disposition / calls table – NULL id fix (export “only up to a date”)
+- **Cause:** Under load, a race in the SQLite driver could leave some call rows with NULL `id`, breaking dashboard export from that point on.
+- **Prevention:**
+  - **log_disposition** now uses `INSERT ... RETURNING id` (SQLite 3.35+) so the inserted id is read atomically; fallback to `lastrowid` on older SQLite.
+  - **WAL mode** enabled in `init_db()`: `PRAGMA journal_mode=WAL` for better concurrency when multiple agents save dispositions.
+- **Runtime healing:** After each disposition save, the server runs `fix_null_call_ids()` to repair any rows with NULL id (so export recovers without restart).
+- **One-time schema fix:** If the DB already has bad rows, run **`Backend/cleandb/fix_db_schema.py`** with the server **stopped** (or use `run_fix_db_schema.bat`). It renames `calls` → `calls_backup`, creates a fresh `calls` table with correct AUTOINCREMENT, copies data (assigning new ids where id was NULL), recreates indexes, and enables WAL. Keeps `calls_backup` for safety.
+- **Docs:** `Backend/docs/NULL_ID_ISSUE_REPORT.md`, `Backend/docs/DISPOSITION_SAVE_ANALYSIS.md`; TROUBLESHOOTING.md updated with steps.
+
+---
+
+## Version 1.9.12 (On development)
+
+### Current approach: testing the Opus pipeline and AMD end-to-end
+
+We are testing an **experimental Opus audio path** alongside the existing WebSocket raw-audio path, so we can validate encoding/decoding, server AMD (VAD + transcription), and listening from the dashboard **without** affecting production agents. When this works, we can consider moving to Opus for cleaner transmission and more accurate transcription (see `IN_DEVELOPMENT.md`).
+
+**What we’ve done so far**
+
+1. **LiveKit room connection off by default**  
+   - The Backend no longer starts the LiveKit worker thread unless `LIVEKIT_ENABLED=1` (or "true"/"yes").  
+   - This avoids firewall/connection issues during development and focuses testing on the Opus pipeline.
+
+2. **Experimental Opus WebSocket endpoint**  
+   - **New endpoint:** `GET /ws/opus/{agent_id}` (existing `/ws/{agent_id}` is unchanged).  
+   - **Protocol:** Client sends binary messages: `[4-byte big-endian length] + [Opus packet bytes]`.  
+   - **Server:** `Backend/opus_handler.py` – `OpusDecoder` (PyAV) decodes Opus → PCM s16 48kHz stereo; same JSON messages as main endpoint (`call_started`, `Call Ended`, `metadata`).  
+   - **Pipeline:** Decoded PCM is fed into the **same** AMD logic (VAD + faster-whisper) and broadcast to admins for “Listen” like the main endpoint.  
+   - **Dependencies:** Backend `requirements.txt` includes `av` (PyAV).
+
+3. **Opus test client (separate folder for another machine)**  
+   - **Folder:** `OpusTester/` – standalone so it can be copied to another PC.  
+   - **Contents:** `opus_tester.py` (connects to `ws://192.168.1.46:80/ws/opus/TesterAgent`), `requirements.txt` (av, websocket-client, PyAudio, numpy), `run_opus_tester.bat`.  
+   - **Behavior:** Captures mic (or sine wave if no mic), encodes PCM to Opus with PyAV, sends `call_started` then stream of `[4-byte length] + Opus packet`.  
+   - **Goal:** Run server on 192.168.1.46, run the tester on another machine; server logs show `[AI] Human detected` or `Speech buffered` when AMD runs; audio can be heard on the dashboard audio-test page.
+
+4. **Dashboard: audio testing page**  
+   - **Bug link:** Top-right of the main dashboard has a bug link → **`/audio-test`**.  
+   - **Audio test page:** Connects to the admin WebSocket, “Start listening to TesterAgent” streams audio from the Opus test client (or any agent on the Opus endpoint).  
+   - **Purpose:** Verify that Opus-decoded audio is broadcast correctly and playable in the browser; read server console for AMD messages.
+
+5. **Summary of testing flow**  
+   - Server runs on 192.168.1.46 (or your host).  
+   - On **another machine:** copy `OpusTester/`, run `pip install -r requirements.txt` once, then `run_opus_tester.bat` (or `python opus_tester.py`).  
+   - On the **server machine:** open `http://192.168.1.46/audio-test`, click “Start listening to TesterAgent”.  
+   - Talk (or let sine wave run); server console should show `[RECV] Opus Agent TesterAgent: audio packet #N`, then `[AI] … Human detected` or `Speech buffered` when AMD triggers.  
+   - This confirms: Opus encode → send → server decode → AMD pipeline → admin listen, all without touching the main Installer or LiveKit.
+
+**Files added/updated in this approach**
+
+- `Backend/opus_handler.py` – OpusDecoder (now using direct libopus ctypes bindings with real Packet Loss Concealment).  
+- `Backend/main.py` – `/ws/opus/{agent_id}`, lifespan LiveKit gated by `LIVEKIT_ENABLED`, `GET /audio-test`, bug link on dashboard, maintenance warning/shutdown control endpoints.  
+- `Backend/templates/audio_test.html` – listen-to-TesterAgent UI.  
+- `OpusTester/` – opus_tester.py, requirements.txt, run_opus_tester.bat (for testing from another machine).  
+- `Backend/requirements.txt` – av, websocket-client, PyAudio (for Backend copy of tester if used locally).  
+- `Installer/modules/settings_manager.py` – defaults for nightly maintenance restart (enabled, 19:00, 300s grace).  
+- `Installer/main.py` – handles `maintenance_warning` (per-agent opt-out dialog) and `maintenance_shutdown` (graceful dialer close).
 
