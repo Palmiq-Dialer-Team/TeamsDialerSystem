@@ -7,9 +7,9 @@ Reference for the Installer app and its modules. See repo root `PROJECT_OVERVIEW
 Everything starts here: the UI, the wiring between components, and the core call flow.
 
 - PyQt6 `QMainWindow` subclass that orchestrates all modules
-- Initializes Excel reader, Teams controller, audio capture, streamer, disposition saver, settings, session manager, filter manager, and campaign manager
+- Initializes Excel reader, Teams controller, audio capture, streamer, disposition saver, settings, session manager, filter manager, campaign manager, and client-side AI (AMD)
 - Uses `sys.coinit_flags = 2` before imports to avoid COM error 0x80010106
-- Runs background threads: `AudioWorker` (capture → queue), `StreamerWorker` (queue → server), `DialingWorker` (Teams automation)
+- Runs background threads: `AudioWorker` (capture → queue), `StreamerWorker` (queue → server), `DialingWorker` (Teams automation), `AMDWorker` (client-side AI)
 
 ### Key Classes & Functions
 
@@ -47,12 +47,12 @@ Checks for updates from the update server, downloads and extracts if newer, then
 | `streamer.py` | WebSocket to Backend; audio + JSON; callbacks and dashboard audio (no server-side AMD) |
 | `teams_auto.py` | Teams dialing; pywinauto "Call" button, call window monitor |
 | `disposition_manager.py` | Save to source `_DISPO_STAMP` + per-disposition Excel files; autosave |
+| `ai_core.py` | Client-side AMD (Silero VAD + faster-whisper, phrase lists, intent detection) |
 | `campaign_manager.py` | FRESH/RECYCLE/TARGETED/ALL filter |
 | `filter_manager.py` | State/Industry/Time filters |
 | `settings_manager.py` | `user_settings.json` |
 | `session_manager.py` | `session_history.json` |
 | `data_handler.py` | Thin wrapper over reader (main.py uses reader directly) |
-<!-- LiveKit-based streaming has been fully retired; audio uses only the WebSocket `AudioStreamer`. -->
 
 ---
 

@@ -52,12 +52,8 @@ This document is a short guide for developers to understand how the pieces fit t
 1. Agent turns on **Start Auto-Call** and starts a call from the Installer.
 2. The app drives the Teams UI to dial the number and notifies the Backend that a call started (metadata + `call_started`).
 3. Audio is captured on the client; **only the loopback (system) channel** is fed to the local AMD pipeline. No audio is sent to the server for AMD.
-4. The **Installer** runs AMD (Silero VAD + faster-whisper in `ai_core.py`). On voicemail/bot/invalid-number or 35s/50s no-answer, it hangs up and auto-advances (next number or next contact). On human detected, it stops the timer and leaves the call connected.
+4. The Installer runs AMD (Silero VAD + faster-whisper in `ai_core.py`). On voicemail / bot / invalid number or 35s/50s no-answer, it hangs up and auto-advances (next number or next contact). On human detected, it stops the timer and leaves the call connected.
 5. When the call ends, the client logs a disposition (Excel + disposition files) and sends it to the Backend for exports.
-
-**Legacy / optional path (server-side AMD):**
-
-- If the client is not using Auto-Call or is an older build, it can still stream audio to the Backend via WebSocket (or LiveKit if enabled). The Backend then runs AMD and may send `force_hangup` to the client. This path remains supported.
 
 ### 2.3 Persistence and exports
 
@@ -130,10 +126,11 @@ Agents connect to `ws://<server-ip>:81` (set in `Installer/config.py`). The Live
 | **Repo root** | `RUN.md` | How to run: server (control panel, venv, rebuild), client (zip, setup, ExecutionPolicy) |
 | **Repo root** | `TROUBLESHOOTING.md` | Common issues (e.g. WebSocket WinError 121 after long uptime) |
 | **Repo root** | `HISTORY.md` | Version history and changes |
-| **Repo root** | `IN_DEVELOPMENT.md` | In progress / roadmap (production testing v2.0.0, LiveKit optional, TTS, first-run tour) |
+| **Repo root** | `IN_DEVELOPMENT.md` | In progress / roadmap (v2.0.0 client-side AI in production, LiveKit optional, TTS, first-run tour) |
 | **Installer/modules/** | `CLIENT_MODULES.md` | Client app and module reference |
-| **Installer/modules/** | `CLIENT_SIDE_AI.md` | Client-side AMD: phrase lists, logic, how to add voicemail/bot phrases, libraries, common errors |
-| **Backend/docs/** | `AMD_WORKFLOW_SPEC.md` | AMD rules: when to hang up, LiveKit + faster-whisper pipeline |
+| **Installer/modules/** | `CLIENT_SIDE_AI.md` | Client-side AMD only: phrase lists, logic, how to add voicemail/bot/invalid-number phrases, libraries, common errors |
+| **Installer/modules/** | `AUTOCALL_WORKFLOW.md` | Autocall button and call-cycle workflow; how Auto-Call interacts with client-side AMD |
+| **Backend/docs/** | `AMD_WORKFLOW_SPEC.md` | AMD rules (client-only): when to hang up vs keep call; Backend does not run AMD |
 | **Backend/cleandb/** | `README_CLEANDB.md` | DB backfill, clean, and fix scripts |
 
 ---
@@ -141,9 +138,7 @@ Agents connect to `ws://<server-ip>:81` (set in `Installer/config.py`). The Live
 ## 6. Where to look next (code)
 
 - `Installer/main.py` – main window, call controls, Auto-Call, Excel integration.
-- `Installer/modules/ai_core.py` – client-side AMD (Silero VAD, faster-whisper, intent detection). **To add or tune voicemail/bot phrases and understand the logic**, see `Installer/modules/CLIENT_SIDE_AI.md`.
+- `Installer/modules/ai_core.py` – client-side AMD (Silero VAD, faster-whisper, intent detection). To add or tune voicemail / bot / invalid-number phrases and understand the logic, see `Installer/modules/CLIENT_SIDE_AI.md`.
 - `Installer/modules/` – Excel reader, Teams automation, audio capture, streamers, settings.
-- `Backend/main.py` – server endpoints and WebSocket handling (and server-side AMD for legacy path).
+- `Backend/main.py` – server endpoints and WebSocket handling (no AMD).
 - `Backend/database.py` – schema and DB helpers.
-- `Backend/livekit_worker.py` – optional LiveKit AMD worker.
-- `Backend/ai_core.py` – server-side AMD (used when client streams audio to server).
