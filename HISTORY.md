@@ -1,10 +1,28 @@
-# TeamsPowerDialer - Version History 
+# TeamsPowerDialer - Version History
 
 Documentation of program status, fixes, and addons by version.
 
 > Full project overview: see `PROJECT_OVERVIEW.md` for architecture, technical flow, module roles, and recent changes.
 
 Version numbering: from version 1.9.9 onward we use x.y.z (e.g. 1.9.11, 1.9.12). Major version 2.0.0 marks the switch to client-side AI. Earlier entries keep the previous numbering for history.
+
+---
+
+## Version 2.0.9
+
+### Autocall and in-call UX
+- Expanded phrase lists and tuning for client-side AMD/autocall so voicemail, invalid-number, and bot-screening phrases are detected more reliably (fewer “No Response” mislabels).
+- Autocall TTS prompts (“Now calling [First Last]…”) are enabled by default so agents get clearer context when the dialer advances through contacts.
+- Small arbitration tweaks in `Installer/main.py` so manual dispositions win over automatic ones and autocall stops more predictably when agents intervene.
+
+### Database / cleandb tools
+- Improved how dispositions are saved and repaired in `Backend/database.py` and `Backend/cleandb/` so manually chosen dispositions reliably overwrite placeholder rows (for example, “No Response” or “No Disposition”).
+- Added and refined `cleandb` scripts:
+  - Repair dispositions from local CSV/XLSX files (`repair_dispositions_from_files.py`) with name+phone / phone-only / name-only matching.
+  - Diagnose file vs DB mismatches (`diagnose_disposition_match.py`) and generate human-readable reports for support.
+  - Dedupe calls per contact name, keeping the row with the most contact info and highest disposition importance.
+  - Fill missing `contact_data` from disposition/lead files and delete rows that still have no usable contact info for exports.
+- Overall: more predictable exports (fewer duplicate or half-empty rows) and safer DB cleanup (always with backups and dry-run modes).
 
 ---
 

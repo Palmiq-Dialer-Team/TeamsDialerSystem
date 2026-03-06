@@ -414,114 +414,118 @@ class DispositionSaver:
     
     def update_source_file(self, workbook_path: str, sheet_name: str, row_index: int, disposition: str, notes: str = None):
         """
-        Updates the original source file with the disposition. Tries live editing first,
-        then falls back to editing the closed file with openpyxl.
-        
+        Update the original source file with the disposition, using a closed-file edit only.
+
+        - For .xlsx/.xlsm: use openpyxl.
+        - For .csv: update the Disposition Stamp (and Notes if present) via pandas.
+
         Args:
-            workbook_path: Path to the workbook
-            sheet_name: Name of the sheet
-            row_index: Row index (0-based from pandas, will be converted to 1-based for Excel)
+            workbook_path: Path to the workbook or CSV
+            sheet_name: Name of the sheet (ignored for CSV)
+            row_index: Row index (0-based from pandas data, or Excel rowNumber-2 for CSV)
             disposition: Disposition type
             notes: Optional notes to save to the Notes column
         """
-        try:
-            # --- ATTEMPT 1: LIVE EDITING ---
-            workbook = self._get_workbook_in_thread()
-            if not workbook:
-                raise Exception("No active Excel application instance.")
-            
-            # Check if the currently active workbook is the one we want to edit.
-            if workbook.FullName.lower() != workbook_path.lower():
-                raise Exception("Target workbook is not the active one.")
-            
-            # If we get here, the correct workbook is active. Proceed with live edit.
-            print("Attempting live update on active source file...")
-            contact_data = {
-                'sheetName': sheet_name,
-                'rowNumber': row_index,
-                'Notes': notes if notes is not None else ''
-            }
-            self._update_source_file(contact_data, disposition)
-            print(f"Successfully updated live source file: {workbook_path}")
-            return  # Success, we are done.
-            
-        except Exception as e:
-            # --- ATTEMPT 2: FALLBACK TO CLOSED-FILE EDITING (OPENPYXL) ---
-            print(f"Live editing failed ({e}), falling back to openpyxl for {workbook_path}")
-            
+        from pathlib import Path
+        path = Path(workbook_path)
+        suffix = path.suffix.lower()
+
+        # --- CSV path: update only Disposition Stamp (and Notes if present) ---
+        if suffix == ".csv":
             try:
-                # Important: Ensure the file is not open in Excel before trying this.
-                # We assume if live edit failed, it's safe to try openpyxl.
-                from openpyxl.styles import PatternFill
-                
-                # Use dynamic colors from settings, with fallback color_map
-                hex_color = self.disposition_colors.get(disposition)
-                if not hex_color:
-                    # Define fill colors based on disposition (fallback - pastel palette)
-                    color_map = {
-                        "Booked Meeting": "C6EFCE",
-                        "Sent Info": "B3E5FC",
-                        "Call Back Later": "FFEB9C",
-                        "Voicemail (Verified)": "E1BEE7",
-                        "No Response": "F2F2F2",
-                        "Not Interested": "FFCCBC",
-                        "Wrong Number": "FFCDD2",
-                        "Invalid Contact": "EF9A9A"
-                    }
-                    clean_hex = color_map.get(disposition, "FFFFFF")  # Default to white if unknown
-                else:
-                    clean_hex = hex_color.lstrip('#')  # openpyxl wants 'RRGGBB'
-                
-                color_fill = PatternFill(start_color=clean_hex, end_color=clean_hex, fill_type="solid")
-                
-                workbook = load_workbook(workbook_path)
-                
-                if sheet_name not in workbook.sheetnames:
-                    print(f"ERROR: Sheet '{sheet_name}' not found in workbook '{workbook_path}'.")
-                    return
-                
-                sheet = workbook[sheet_name]
-                
-                # Find the columns for "Disposition Stamp", "Status Color", and "Notes"
-                disposition_col = None
-                color_col = None
-                notes_col = None
-                for col in range(1, sheet.max_column + 1):
-                    header = sheet.cell(row=1, column=col).value
-                    if header and str(header).strip():
-                        header_str = str(header).strip().lower()
-                        if header_str == "disposition stamp":
-                            disposition_col = col
-                        elif header_str == "status color":
-                            color_col = col
-                        elif header_str == "notes":
-                            notes_col = col
-                
-                if not disposition_col or not color_col:
-                    print("ERROR: 'Disposition Stamp' or 'Status Color' columns not found in source file.")
-                    return
-                
-                # Note: openpyxl uses 1-based indexing for rows.
-                # The row_index from pandas is 0-based for data, so we add 2 (1 for header, 1 for 0-base).
-                target_row = row_index + 2
-                
-                # Update the cells
-                sheet.cell(row=target_row, column=disposition_col).value = disposition
-                sheet.cell(row=target_row, column=color_col).fill = color_fill
-                
-                # Update Notes column if it exists
-                if notes_col and notes is not None:
-                    sheet.cell(row=target_row, column=notes_col).value = notes
-                
-                workbook.save(workbook_path)
-                print(f"Successfully updated closed source file: {workbook_path}")
-                
-            except PermissionError:
-                print(f"FATAL ERROR: Could not update source file with openpyxl. The file is likely open and locked by Excel. Please close the file and try again.")
-            except Exception as ex_openpyxl:
-                print(f"ERROR: An unexpected error occurred with openpyxl: {ex_openpyxl}")
-                import traceback
-                traceback.print_exc()
+                import pandas as pd
+                df = pd.read_csv(path)
+            except Exception as e:
+                print(f"CSV update failed: could not read {path}: {e}")
+                return
+
+            # row_index is expected to be a 0-based data index for CSV
+            idx = row_index
+            if not isinstance(idx, int) or idx < 0 or idx >= len(df):
+                print(f"CSV update skipped: row index {idx} out of range for {path}")
+                return
+
+            if "Disposition Stamp" in df.columns:
+                df.loc[idx, "Disposition Stamp"] = disposition
+
+            if notes is not None and "Notes" in df.columns:
+                df.loc[idx, "Notes"] = notes
+
+            try:
+                df.to_csv(path, index=False)
+                print(f"Updated CSV source file: row index {idx} in {path}")
+            except Exception as e:
+                print(f"Failed to write CSV {path}: {e}")
+            return
+
+        # --- XLSX/xlsm path: closed-file editing with openpyxl ---
+        try:
+            from openpyxl.styles import PatternFill
+
+            # Use dynamic colors from settings, with fallback color_map
+            hex_color = self.disposition_colors.get(disposition)
+            if not hex_color:
+                color_map = {
+                    "Booked Meeting": "C6EFCE",
+                    "Sent Info": "B3E5FC",
+                    "Call Back Later": "FFEB9C",
+                    "Voicemail (Verified)": "E1BEE7",
+                    "No Response": "F2F2F2",
+                    "Not Interested": "FFCCBC",
+                    "Wrong Number": "FFCDD2",
+                    "Invalid Contact": "EF9A9A"
+                }
+                clean_hex = color_map.get(disposition, "FFFFFF")  # Default to white if unknown
+            else:
+                clean_hex = hex_color.lstrip('#')  # openpyxl wants 'RRGGBB'
+
+            color_fill = PatternFill(start_color=clean_hex, end_color=clean_hex, fill_type="solid")
+
+            workbook = load_workbook(workbook_path)
+
+            if sheet_name not in workbook.sheetnames:
+                print(f"ERROR: Sheet '{sheet_name}' not found in workbook '{workbook_path}'.")
+                return
+
+            sheet = workbook[sheet_name]
+
+            # Find the columns for "Disposition Stamp", "Status Color", and "Notes"
+            disposition_col = None
+            color_col = None
+            notes_col = None
+            for col in range(1, sheet.max_column + 1):
+                header = sheet.cell(row=1, column=col).value
+                if header and str(header).strip():
+                    header_str = str(header).strip().lower()
+                    if header_str == "disposition stamp":
+                        disposition_col = col
+                    elif header_str == "status color":
+                        color_col = col
+                    elif header_str == "notes":
+                        notes_col = col
+
+            if not disposition_col or not color_col:
+                print("ERROR: 'Disposition Stamp' or 'Status Color' columns not found in source file.")
+                return
+
+            # openpyxl uses 1-based indexing; row_index is 0-based data index => add 2 (1 header, 1 for 0-base)
+            target_row = row_index + 2
+
+            sheet.cell(row=target_row, column=disposition_col).value = disposition
+            sheet.cell(row=target_row, column=color_col).fill = color_fill
+
+            if notes_col and notes is not None:
+                sheet.cell(row=target_row, column=notes_col).value = notes
+
+            workbook.save(workbook_path)
+            print(f"Successfully updated closed source file: {workbook_path} (row index {row_index})")
+
+        except PermissionError:
+            print(f"FATAL ERROR: Could not update source file with openpyxl. The file is likely open and locked by Excel. Please close the file and try again.")
+        except Exception as ex_openpyxl:
+            print(f"ERROR: An unexpected error occurred with openpyxl: {ex_openpyxl}")
+            import traceback
+            traceback.print_exc()
     
     def remove_contact_from_file(self, contact_data: dict, disposition_name: str):
         """

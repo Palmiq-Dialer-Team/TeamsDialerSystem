@@ -17,19 +17,22 @@
     <h1>Remote Console</h1>
     <div class="status">Authenticated. Use with care.</div>
     <div class="actions">
-        <form method="post" action="/remote-console/shutdown" onsubmit="return confirm('Shut down server now? Existing connections will be drained.');">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button type="submit" class="btn-shutdown">Shutdown Server</button>
-        </form>
-        <form method="post" action="/remote-console/restart" onsubmit="return confirm('Restart server now? Existing connections will be drained.');">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button type="submit" class="btn-restart">Restart Server</button>
-        </form>
+        <button type="button" class="btn-restart"
+                onclick="postConsoleAction('/remote-console/restart', 'Restart server now? Existing connections will be drained.', true);">
+            Restart Server
+        </button>
+        <button type="button" class="btn-release"
+                onclick="postConsoleAction('/remote-console/push-client-update', 'Run client release script now?');">
+            Push Client Update
+        </button>
     </div>
+    <div id="action-status" class="status"></div>
     <div class="status">Recent logs:</div>
     <div id="log-container" class="log-container">Loading logs...</div>
 
     <script>
+        const csrfToken = "{{ csrf_token }}";
+
         async function loadLogs() {
             try {
                 const res = await fetch('/remote-console/logs?lines=200', { cache: 'no-store' });
@@ -42,6 +45,44 @@
                 document.getElementById('log-container').textContent = lines.join('');
             } catch (e) {
                 document.getElementById('log-container').textContent = 'Error loading logs: ' + e;
+            }
+        }
+
+        async function postConsoleAction(url, confirmMessage, redirectToLogin) {
+            if (!confirm(confirmMessage)) {
+                return;
+            }
+            const statusEl = document.getElementById('action-status');
+            statusEl.textContent = 'Sending request...';
+
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({ csrf_token: csrfToken })
+                });
+
+                let data = {};
+                try {
+                    data = await res.json();
+                } catch (e) {
+                    // Non-JSON response (e.g., on shutdown), ignore parse error
+                }
+
+                statusEl.textContent = 'Response ' + res.status +
+                    (data.returncode !== undefined ? ', return code: ' + data.returncode : '');
+
+                // Refresh logs so the appended output is visible quickly
+                loadLogs();
+
+                // Optional redirect after successful restart
+                if (redirectToLogin && res.ok) {
+                    setTimeout(function () {
+                        window.location.href = '/remote-console/login';
+                    }, 1000);
+                }
+            } catch (e) {
+                statusEl.textContent = 'Request failed: ' + e;
             }
         }
 

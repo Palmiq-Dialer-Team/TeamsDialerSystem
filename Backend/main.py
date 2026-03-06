@@ -30,6 +30,8 @@ import database
 from outlook_manager import OutlookManager
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Project root is one level above Backend (where release_client.py lives)
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, os.pardir))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 ANNOUNCEMENT_IMAGES_DIR = os.path.join(BASE_DIR, "announcement_images")
 
@@ -642,7 +644,14 @@ async def remote_console_shutdown(request: Request):
 
 @app.post("/remote-console/restart")
 async def remote_console_restart(request: Request):
-    """Logical restart from remote console: same as shutdown (external watchdog restarts uvicorn)."""
+    """
+    Logical restart requested from remote console.
+
+    This does not kill the server process directly. Instead, it logs a marker line that
+    the Server Control Panel can see in its log stream and use to trigger its own
+    restart logic (ServerController.restart), so the control panel stays in sync and
+    keeps log ownership.
+    """
     if not _remote_console_is_enabled():
         return JSONResponse({"error": "disabled"}, status_code=404)
 
@@ -657,9 +666,74 @@ async def remote_console_restart(request: Request):
     if not csrf_form or not hmac.compare_digest(csrf_form, csrf_expected):
         return JSONResponse({"error": "invalid_csrf"}, status_code=400)
 
-    print("[RemoteConsole] Restart requested via remote console (graceful shutdown, external restart expected).")
-    os.kill(os.getpid(), signal.SIGTERM)
+    # Marker line consumed by the Server Control Panel's log reader to trigger restart.
+    print("[RemoteConsole] CMD:RESTART_SERVER")
+
     return JSONResponse({"ok": True})
+
+
+@app.post("/remote-console/push-client-update")
+async def remote_console_push_client_update(request: Request):
+    """Run release_client.py from remote console and append output to the log."""
+    if not _remote_console_is_enabled():
+        return JSONResponse({"error": "disabled"}, status_code=404)
+
+    # Require a valid remote console session
+    session_id = request.cookies.get("remote_console_session")
+    session = _remote_console_get_session(session_id)
+    if not session:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    # CSRF protection (same pattern as shutdown/restart)
+    form = await request.form()
+    csrf_form = (form.get("csrf_token") or "").strip()
+    csrf_expected = session.get("csrf_token", "")
+    if not csrf_form or not hmac.compare_digest(csrf_form, csrf_expected):
+        return JSONResponse({"error": "invalid_csrf"}, status_code=400)
+
+    cmd = [sys.executable, "release_client.py"]
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        # Synchronous run; remote console caller waits for completion.
+        result = subprocess.run(
+            cmd,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        rc = result.returncode
+    except Exception as e:
+        stdout = ""
+        stderr = f"[RemoteConsole] Exception while running release_client.py: {e}\n"
+        rc = -1
+
+    # Append script output to the same log tailed by /remote-console/logs
+    try:
+        with open(REMOTE_CONSOLE_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"[{timestamp}] [RemoteConsole] Push client update requested.\n")
+            f.write(f"[{timestamp}] [RemoteConsole] Command: {cmd}\n")
+            if stdout:
+                f.write(f"[{timestamp}] [RemoteConsole] release_client.py stdout:\n{stdout}\n")
+            if stderr:
+                f.write(f"[{timestamp}] [RemoteConsole] release_client.py stderr:\n{stderr}\n")
+            f.write(f"[{timestamp}] [RemoteConsole] release_client.py exit code: {rc}\n\n")
+    except Exception as e:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"failed_to_write_log: {e}",
+                "returncode": rc,
+                "stdout": stdout,
+                "stderr": stderr,
+            },
+            status_code=500,
+        )
+
+    return JSONResponse({"ok": rc == 0, "returncode": rc})
 
 
 @app.get("/", response_class=HTMLResponse)

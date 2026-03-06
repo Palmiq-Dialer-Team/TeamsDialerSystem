@@ -19,3 +19,4 @@ torch
 torchaudio
 faster-whisper
 pip-system-certs
+pyttsx3

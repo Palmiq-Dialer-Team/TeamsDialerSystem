@@ -46,6 +46,7 @@ DEFAULT_SETTINGS = {
     "calling": {
         "auto_call_enabled": True,  # Enable call monitoring and auto-advance on timeout
         "auto_call_on_disposition": False,  # Auto-call next number after No Response (same contact only)
+        "announce_contact_tts": False,  # Say "Now calling [Name]" before first number of each contact
     },
     "reminders": {
         "enabled": False,
@@ -164,12 +165,14 @@ class SettingsManager:
         """Returns the calling settings (auto-call, etc.)."""
         return self.settings.get("calling", DEFAULT_SETTINGS["calling"]).copy()
 
-    def set_calling_settings(self, auto_call_enabled, auto_call_on_disposition=None):
+    def set_calling_settings(self, auto_call_enabled, auto_call_on_disposition=None, announce_contact_tts=None):
         """Updates calling settings."""
         self.settings.setdefault("calling", {})
         self.settings["calling"]["auto_call_enabled"] = bool(auto_call_enabled)
         if auto_call_on_disposition is not None:
             self.settings["calling"]["auto_call_on_disposition"] = bool(auto_call_on_disposition)
+        if announce_contact_tts is not None:
+            self.settings["calling"]["announce_contact_tts"] = bool(announce_contact_tts)
         self.save_settings()
 
     def get_reminder_settings(self):

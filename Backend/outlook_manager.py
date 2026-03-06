@@ -38,6 +38,18 @@ def _safe_get(data: dict, key: str, default: str = "N/A"):
     return str(val).strip() if val else default
 
 
+def _extract_phone_like(notes: str) -> str:
+    """
+    Try to extract a phone-like string from free-form notes.
+    Keeps only characters typically used in phone numbers.
+    """
+    if not notes:
+        return ""
+    allowed = set("0123456789+()- ")
+    filtered = "".join(ch for ch in str(notes) if ch in allowed).strip()
+    return filtered
+
+
 def _format_callback_event(contact_data_dict, notes="", source_workbook_path=None, source_sheet_name=None):
     """
     Build Outlook event subject and body from full contact metadata.
@@ -53,23 +65,35 @@ def _format_callback_event(contact_data_dict, notes="", source_workbook_path=Non
 
     subject = f"Callback: {contact_name} ({company})"
 
-    # Optional reminder notes (from the callback, not the row)
+    # Number to call (derived from callback notes)
     notes_line = ""
-    if (notes or "").strip():
-        notes_line = f'<p><b>Reminder notes:</b> {_html_escape((notes or "").strip())}</p>'
+    phone_str = _extract_phone_like((notes or "").strip())
+    if phone_str:
+        notes_line = f'<p><b>Number to call:</b> {_html_escape(phone_str)}</p>'
 
-    # Source folder line if we have it
-    sheet = (source_sheet_name or contact_data_dict.get("sheetName") or "").strip() or "N/A"
-    workbook = (source_workbook_path or contact_data_dict.get("workbook_path") or "").strip()
-    if workbook:
-        source_folder = f"{sheet} ({os.path.basename(workbook)})"
-    else:
-        source_folder = sheet
-    source_line = f'<p><b>Source:</b> {_html_escape(source_folder)}</p>' if source_folder and source_folder != "N/A" else ""
+    # Full contact_data row: every key/value from the database (title, company, etc.),
+    # excluding internal / noisy fields that should not appear in the invite.
+    EXCLUDED_KEYS = {
+        "Phone Objects",
+        "Phone_Objects",
+        "phone_objects",
+        "Source",
+        "Original Row",
+        "original_row",
+        "Current Disposition",
+        "current_disposition",
+        "Row Number",
+        "Row Index",
+        "row_index",
+        "Sheet Name",
+        "sheetName",
+        "source_row_index",
+    }
 
-    # Full contact_data row: every key/value from the database (title, company, phones, etc.)
     rows_html = []
     for key, val in sorted(contact_data_dict.items()):
+        if key in EXCLUDED_KEYS:
+            continue
         display_val = _format_contact_value(val)
         rows_html.append(f"<tr><td style=\"vertical-align:top;padding:2px 8px 2px 0;\"><b>{_html_escape(key)}:</b></td><td style=\"padding:2px 0;\">{display_val if display_val else '<i>—</i>'}</td></tr>")
 
@@ -78,8 +102,7 @@ def _format_callback_event(contact_data_dict, notes="", source_workbook_path=Non
     body = f"""
     <h3>Callback Reminder</h3>
     {notes_line}
-    {source_line}
-    <h4>Contact (full row)</h4>
+    <h4>Contact details</h4>
     {table}
     """
     return subject, body

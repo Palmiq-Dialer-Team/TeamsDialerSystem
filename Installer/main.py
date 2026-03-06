@@ -31,6 +31,11 @@ import os
 import json
 from datetime import datetime
 
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
+
 from modules.active_data_reader import ActiveExcelReader
 from modules.teams_auto import TeamsController
 from modules.audio_core import AudioCapture
@@ -521,6 +526,15 @@ class SettingsDialog(QDialog):
         self.auto_call_on_disposition_checkbox.setChecked(calling_settings.get("auto_call_on_disposition", False))
         auto_call_layout.addWidget(self.auto_call_on_disposition_checkbox)
         
+        # Optional TTS announcement before dialing the first number of each contact
+        self.announce_contact_tts_checkbox = QCheckBox("Announce contact name before calling")
+        self.announce_contact_tts_checkbox.setToolTip(
+            "When enabled: before dialing the first number of each contact, the app will say "
+            "\"Now calling [First Name] [Last Name]\" using your system's default voice."
+        )
+        self.announce_contact_tts_checkbox.setChecked(calling_settings.get("announce_contact_tts", False))
+        auto_call_layout.addWidget(self.announce_contact_tts_checkbox)
+        
         layout.addWidget(auto_call_group)
         layout.addSpacing(20)
         
@@ -646,7 +660,10 @@ class SettingsDialog(QDialog):
         self.settings_manager.set_phone_priority(new_order_phones, new_disabled_phones)
         
         auto_call_on_disposition = self.auto_call_on_disposition_checkbox.isChecked()
-        self.settings_manager.set_calling_settings(False, auto_call_on_disposition)  # auto_call_enabled controlled by main UI button
+        announce_contact_tts = getattr(self, "announce_contact_tts_checkbox", None)
+        announce_contact_tts_enabled = bool(announce_contact_tts.isChecked()) if announce_contact_tts else False
+        # auto_call_enabled is controlled by the main UI toggle button, not this dialog
+        self.settings_manager.set_calling_settings(False, auto_call_on_disposition, announce_contact_tts_enabled)
 
         r_enabled = self.reminders_enabled.isChecked()
         r_email = self.agent_email_input.text()
@@ -1243,6 +1260,7 @@ class OverdueCallbacksDialog(QDialog):
 class TeamsPowerDialerApp(QMainWindow):
     """Main app window."""
     ai_models_loaded_signal = pyqtSignal(object)
+    tts_finished_signal = pyqtSignal()
     
     def __init__(self):
         super().__init__()
@@ -1309,6 +1327,7 @@ class TeamsPowerDialerApp(QMainWindow):
         self.saved_state = None  # Save state when "Call Now" from callback
         
         self.has_no_response_history = False  # Track if contact had "No Response" during session
+        self._tts_announced_for_current_contact = False  # TTS "Now calling ..." played for this contact
         
         self.history_stack = []  # Stack to track disposition actions for undo
         
@@ -1355,6 +1374,7 @@ class TeamsPowerDialerApp(QMainWindow):
         self.streamer.start()
         
         self.ai_models_loaded_signal.connect(self._on_ai_models_loaded)
+        self.tts_finished_signal.connect(self.start_call)
         self.statusBar().showMessage("Loading AI models (PyTorch/Whisper)...")
         print("[AI] Loading AI models (PyTorch/Whisper)...")
         threading.Thread(target=self._init_ai_models, daemon=True).start()
@@ -2025,6 +2045,8 @@ class TeamsPowerDialerApp(QMainWindow):
             return
         
         self.has_no_response_history = False
+        # Reset per-contact TTS flag when we move to or redisplay a contact
+        self._tts_announced_for_current_contact = False
         
         self.current_contact = self.contact_list[self.current_index]
         
@@ -2623,7 +2645,24 @@ class TeamsPowerDialerApp(QMainWindow):
                 "campaign_mode": "General",
             })
             if current_phone:
-                disp = getattr(self, "_pending_force_hangup_disposition", None) or "No Disposition"
+                # For manual calls we log 'No Disposition' at call end and later apply the final choice
+                # via update_disposition. During autocall/AMD we previously logged 'No Response' for
+                # every number the bot hung up on, which created many duplicate No Response rows in
+                # the server DB (one per number). To keep exports/statistics cleaner, we treat
+                # bot-initiated No Response during autocall the same as manual flow and log it as
+                # 'No Disposition' instead; only the eventual final disposition (if any) will be
+                # written as a real disposition via update_disposition or repair scripts.
+                pending_disp = getattr(self, "_pending_force_hangup_disposition", None)
+                auto_bot_no_response = (
+                    getattr(self, "is_autocalling_active", False)
+                    and getattr(self, "_bot_initiated_hangup", False)
+                    and pending_disp == "No Response"
+                )
+                if auto_bot_no_response:
+                    disp = "No Disposition"
+                else:
+                    disp = pending_disp or "No Disposition"
+
                 payload = {
                     "type": "log_disposition",
                     "agent_id": agent_id,
@@ -2642,7 +2681,7 @@ class TeamsPowerDialerApp(QMainWindow):
                 self.streamer.send_json_message(payload)
                 # Mark that we created a call record - handle_disposition will only send update_disposition if this is True
                 self._call_record_created = True
-            
+
             # --- Smart arbitrator for hangup reason / autocall behavior ---
             # 1) Last transcript fail-safe for invalid number
             last_text = ""
@@ -2795,6 +2834,39 @@ class TeamsPowerDialerApp(QMainWindow):
             seconds = elapsed % 60
             self.call_status_label.setText(f"In Call ({minutes:02d}:{seconds:02d})")
 
+    def announce_and_call(self, contact_name: str):
+        """
+        Play a short TTS announcement like 'Now calling John Doe' and,
+        when finished, trigger start_call() on the GUI thread.
+        """
+        # If there is nothing meaningful to say, just proceed to dialing.
+        safe_name = (contact_name or "").strip()
+        if not safe_name:
+            # No usable name; behave as if TTS finished and just dial.
+            self.tts_finished_signal.emit()
+            return
+
+        if pyttsx3 is None:
+            print("[TTS] pyttsx3 is not installed; skipping contact announcement.")
+            # Treat as if announcement completed and proceed to dialing.
+            self.tts_finished_signal.emit()
+            return
+
+        def _worker():
+            try:
+                engine = pyttsx3.init()
+                base_rate=engine.getProperty("rate")
+                engine.setProperty("rate", int(base_rate*0.8))
+                engine.say(f"Now calling {safe_name}")
+                engine.runAndWait()
+            except Exception as e:
+                print(f"[TTS] Error during announcement: {e}")
+            finally:
+                # After TTS finishes (or on error), emit a signal so the GUI thread dials.
+                self.tts_finished_signal.emit()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def start_call(self):
         """Start a call to the current phone number - non-blocking Teams automation"""
         if getattr(self, "waiting_for_disposition", False):
@@ -2812,7 +2884,25 @@ class TeamsPowerDialerApp(QMainWindow):
         phones = self.current_contact.get('Phones', [])
         if not phones or self.current_phone_idx >= len(phones):
             return
-        
+
+        # Optional TTS gate: announce contact name once before the first number of each contact.
+        calling_settings = self.settings_manager.get_calling_settings()
+        if (calling_settings.get("announce_contact_tts", False)
+                and self.current_phone_idx == 0
+                and not getattr(self, "_tts_announced_for_current_contact", False)):
+            # Mark that we've already announced for this contact to avoid loops when start_call()
+            # is invoked again after TTS completes.
+            self._tts_announced_for_current_contact = True
+            first_name = self.current_contact.get('First Name', '')
+            last_name = self.current_contact.get('Last Name', '')
+            full_name = f"{first_name} {last_name}".strip()
+            if full_name:
+                self.call_btn.setEnabled(False)
+                self.statusBar().showMessage(f"TTS: Announcing {full_name}...")
+                self.announce_and_call(full_name)
+                return
+            # If there is no usable name, fall through and just dial as usual.
+
         current_phone = phones[self.current_phone_idx]
 
         self.call_btn.setEnabled(False)
@@ -2999,15 +3089,31 @@ class TeamsPowerDialerApp(QMainWindow):
         # Check if we are in a temporary callback state (callback call flow)
         if self.saved_state:
             print("Handling disposition for a temporary callback call.")
-            # We still need to save the disposition for the contact that was called
-            if self.current_contact:
-                self.disposition_saver.save_contact_async(self.current_contact, disposition)
+            # For callbacks, update the original source file using stored metadata (no COM / live Excel).
+            meta = getattr(self, "current_callback_meta", {}) or {}
+            workbook_path = meta.get("workbook_path")
+            sheet_name = meta.get("sheet_name")
+            row_index = meta.get("row_index")
+            if workbook_path and sheet_name and isinstance(row_index, int):
+                try:
+                    notes_text = self.notes_text.toPlainText() if hasattr(self, "notes_text") else ""
+                    self.disposition_saver.update_source_file(
+                        workbook_path=workbook_path,
+                        sheet_name=sheet_name,
+                        row_index=row_index,
+                        disposition=disposition,
+                        notes=notes_text,
+                    )
+                except Exception as e:
+                    print(f"Error updating source file for callback disposition: {e}")
 
             # Restore the previous state
             self.contact_list = self.saved_state.get("contact_list", [])
             self.current_index = self.saved_state.get("current_index", 0)
             self.current_phone_idx = self.saved_state.get("current_phone_idx", 0)
             self.saved_state = None  # Clear the saved state
+            if hasattr(self, "current_callback_meta"):
+                delattr(self, "current_callback_meta")
 
             # Reset UI to the restored state
             self.display_current_contact()
@@ -3243,8 +3349,10 @@ class TeamsPowerDialerApp(QMainWindow):
             self.display_current_contact()
             # Auto-call next contact's first number only when disposition was No Response and setting is on (avoid double dial with Autocall)
             calling_settings = self.settings_manager.get_calling_settings()
-            if (disposition == "No Response" and calling_settings.get("auto_call_on_disposition", False)
-                    and not self.waiting_for_disposition and not self.is_autocalling_active):
+            if (disposition in ("No Response", "Invalid Contact", "Voicemail (Verified)") 
+                    and calling_settings.get("auto_call_on_disposition", False)
+                    and not self.waiting_for_disposition 
+                    and not self.is_autocalling_active):
                 QTimer.singleShot(400, self.start_call)
         
         # If we were paused after a confirmed human call, resume or reset autocall state now
@@ -3786,6 +3894,18 @@ class TeamsPowerDialerApp(QMainWindow):
             "contact_list": self.contact_list.copy() if self.contact_list else [],
             "current_index": self.current_index,
             "current_phone_idx": self.current_phone_idx
+        }
+
+        # Remember callback source metadata for Excel/CSV update after call
+        # These fields are provided by the server when the callback was created.
+        self.current_callback_meta = {
+            "workbook_path": callback_data.get("source_workbook_path"),
+            "sheet_name": callback_data.get("source_sheet_name"),
+            # For closed-file editing we expect a 0-based data row index.
+            # The server currently stores source_row_index as the Excel row number
+            # (including header), so convert it here when possible.
+            "row_index": (callback_data.get("source_row_index") - 2)
+            if isinstance(callback_data.get("source_row_index"), int) else None,
         }
         
         # Set as current contact

@@ -278,9 +278,23 @@ def update_call_disposition(data: Dict[str, Any]) -> bool:
         (agent_id, phone, cutoff),
     )
     row = cursor.fetchone()
+
+    # Fallback: if no 'No Disposition' row exists (e.g. autocall/AI already set a disposition
+    # like "No Response"), update the most recent call for this agent+phone in the same window.
     if not row:
-        conn.close()
-        return False
+        cursor.execute(
+            """
+            SELECT id FROM calls
+            WHERE agent_id = ? AND phone = ? AND timestamp >= ?
+            ORDER BY timestamp DESC LIMIT 1
+            """,
+            (agent_id, phone, cutoff),
+        )
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False
+
     call_id = row[0]
 
     # Optional contact_data update (when client provides it)

@@ -428,10 +428,22 @@ class ControlPanelApp:
     def _poll_output(self):
         self._pause_log = self.var_pause.get()
         if not self._pause_log and self._log_queue:
-            self._log_buffer.extend(self._log_queue)
+            # Capture new lines from server
+            new_lines = self._log_queue[:]
             self._log_queue.clear()
+
+            # Append to buffer for display
+            self._log_buffer.extend(new_lines)
             if len(self._log_buffer) > self._log_max_lines:
                 self._log_buffer = self._log_buffer[-self._log_max_lines:]
+
+            # Check for remote console restart command in new log lines
+            for line in new_lines:
+                if "[RemoteConsole] CMD:RESTART_SERVER" in line:
+                    # Schedule restart on the Tk main loop so it runs on the GUI thread
+                    self.root.after(0, self._restart)
+                    break
+
             self._refresh_log_display()
         self._update_buttons()
         self.root.after(200, self._poll_output)
