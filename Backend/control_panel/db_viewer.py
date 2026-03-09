@@ -3,18 +3,20 @@ import json
 import tkinter as tk
 from tkinter import ttk, messagebox
 import sqlite3
-import shutil
 import urllib.request
 from pathlib import Path
 from datetime import datetime
 
-from .config import DB_PATH, DASHBOARD_URL, SNAPSHOT_DIR
+from .config import DB_PATH, DASHBOARD_URL, SNAPSHOT_DIR, build_auth_headers
 
 
 def _server_database_path() -> str | None:
     """Return the DB path reported by the server, or None if unreachable."""
     try:
-        req = urllib.request.Request(f"{DASHBOARD_URL.rstrip('/')}/api/debug/status")
+        req = urllib.request.Request(
+            f"{DASHBOARD_URL.rstrip('/')}/api/debug/status",
+            headers=build_auth_headers(),
+        )
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read().decode())
             return data.get("database_path")
@@ -69,7 +71,13 @@ def _create_snapshot() -> Path | None:
     _ensure_snapshot_dir()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     snap = SNAPSHOT_DIR / f"teams_dialer_snapshot_{ts}.db"
-    shutil.copy2(DB_PATH, snap)
+    source = sqlite3.connect(str(DB_PATH), timeout=10)
+    dest = sqlite3.connect(str(snap), timeout=10)
+    try:
+        source.backup(dest)
+    finally:
+        dest.close()
+        source.close()
     return snap
 
 

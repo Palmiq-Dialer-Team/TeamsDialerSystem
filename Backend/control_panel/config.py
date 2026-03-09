@@ -22,6 +22,7 @@ SNAPSHOT_DIR = BACKEND_DIR / "db_snapshots"
 # Server defaults (direct uvicorn)
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 80
+INTERNAL_API_TOKEN = os.environ.get("INTERNAL_API_TOKEN", "").strip()
 
 # Dashboard URL (for "Open in Browser")
 DASHBOARD_URL = "http://127.0.0.1"
@@ -48,3 +49,10 @@ UVICORN_ARGS = [
     "--timeout-keep-alive", "75",
     "--workers", "1",
 ]
+
+
+def build_auth_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if INTERNAL_API_TOKEN:
+        headers["Authorization"] = f"Bearer {INTERNAL_API_TOKEN}"
+    return headers

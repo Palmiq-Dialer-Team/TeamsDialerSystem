@@ -8,7 +8,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Callable
 
-from .config import BACKEND_DIR, VENV_PYTHON, UVICORN_ARGS, SERVER_PORT
+from .config import BACKEND_DIR, VENV_PYTHON, UVICORN_ARGS, SERVER_PORT, build_auth_headers
 
 SHUTDOWN_GRACEFUL_TIMEOUT = 30
 
@@ -130,7 +130,12 @@ class ServerController:
             # Try graceful shutdown via HTTP first (lets uvicorn drain connections)
             shutdown_url = f"http://127.0.0.1:{SERVER_PORT}/api/control/shutdown"
             try:
-                req = urllib.request.Request(shutdown_url, data=b"", method="POST")
+                req = urllib.request.Request(
+                    shutdown_url,
+                    data=b"",
+                    method="POST",
+                    headers=build_auth_headers(),
+                )
                 urllib.request.urlopen(req, timeout=5)
             except Exception:
                 pass  # Server may already be down; proceed to terminate

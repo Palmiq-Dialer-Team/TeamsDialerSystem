@@ -86,13 +86,18 @@ def get_current_version() -> str:
 
 
 def bump_version(current: str) -> str:
-    """
-    Increment semantic version: bump patch (x.y.z -> x.y.(z+1)).
-    Legacy numeric formats are normalized first.
-    """
-    v = _parse_version_tuple(current)
-    major, minor, patch = v
-    patch += 1
+    major, minor, patch = _parse_version_tuple(current)
+    assert major>=0
+    assert 0 <=minor<=99
+    assert 0 <=patch<=99
+    patch +=1
+    if patch >9:
+        patch =0
+        minor+=1
+        if minor>9:
+            minor=0
+            major+=1
+
     return _version_tuple_to_str((major, minor, patch))
 
 

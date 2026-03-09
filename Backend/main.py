@@ -33,6 +33,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Project root is one level above Backend (where release_client.py lives)
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, os.pardir))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 ANNOUNCEMENT_IMAGES_DIR = os.path.join(BASE_DIR, "announcement_images")
 
 
@@ -81,6 +82,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 if os.path.isdir(ANNOUNCEMENT_IMAGES_DIR):
     app.mount("/static/announcements", StaticFiles(directory=ANNOUNCEMENT_IMAGES_DIR), name="announcement_images")
 
@@ -95,6 +98,7 @@ REMOTE_CONSOLE_PASSWORD_HASH = os.getenv("REMOTE_CONSOLE_PASSWORD_HASH", "").str
 REMOTE_CONSOLE_SESSION_TTL_SECONDS = int(os.getenv("REMOTE_CONSOLE_SESSION_TTL_SECONDS", "3600") or "3600")
 REMOTE_CONSOLE_MAX_ATTEMPTS = int(os.getenv("REMOTE_CONSOLE_MAX_ATTEMPTS", "5") or "5")
 REMOTE_CONSOLE_ATTEMPT_WINDOW_SECONDS = int(os.getenv("REMOTE_CONSOLE_ATTEMPT_WINDOW_SECONDS", "900") or "900")
+INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "").strip()
 _raw_log_path = os.getenv("REMOTE_CONSOLE_LOG_PATH", "").strip() or os.path.join(BASE_DIR, "server.log")
 REMOTE_CONSOLE_LOG_PATH = os.path.normpath(os.path.abspath(_raw_log_path) if os.path.isabs(_raw_log_path) else os.path.join(BASE_DIR, _raw_log_path))
 
@@ -116,6 +120,17 @@ def _remote_console_verify_password(password: str) -> bool:
         return False
     computed = _hash_remote_console_password(password)
     return hmac.compare_digest(computed, REMOTE_CONSOLE_PASSWORD_HASH)
+
+
+def _request_is_local_or_authorized(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    if client_host in ("127.0.0.1", "::1", "localhost"):
+        return True
+    if not INTERNAL_API_TOKEN:
+        return False
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    expected = f"Bearer {INTERNAL_API_TOKEN}"
+    return hmac.compare_digest(auth_header, expected)
 
 
 def _remote_console_prune_attempts(ip: str, now: float) -> List[float]:
@@ -385,8 +400,7 @@ class MaintenanceRequest(BaseModel):
 @app.post("/api/control/shutdown")
 async def shutdown_endpoint(request: Request):
     """Graceful shutdown: localhost-only. Sends SIGTERM so uvicorn drains connections."""
-    client_host = request.client.host if request.client else ""
-    if client_host not in ("127.0.0.1", "::1", "localhost"):
+    if not _request_is_local_or_authorized(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     os.kill(os.getpid(), signal.SIGTERM)
     return {"ok": True}
@@ -395,8 +409,7 @@ async def shutdown_endpoint(request: Request):
 @app.post("/api/control/maintenance_warning")
 async def maintenance_warning_endpoint(request: Request, body: MaintenanceRequest):
     """Send maintenance warning to all agents. Localhost-only."""
-    client_host = request.client.host if request.client else ""
-    if client_host not in ("127.0.0.1", "::1", "localhost"):
+    if not _request_is_local_or_authorized(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     global current_maintenance_id, maintenance_opt_out_agents
     maintenance_id = body.maintenance_id or str(int(time.time()))
@@ -420,8 +433,7 @@ async def maintenance_warning_endpoint(request: Request, body: MaintenanceReques
 @app.post("/api/control/maintenance_shutdown")
 async def maintenance_shutdown_endpoint(request: Request, body: MaintenanceRequest):
     """Send maintenance shutdown to all agents except those who opted out. Localhost-only."""
-    client_host = request.client.host if request.client else ""
-    if client_host not in ("127.0.0.1", "::1", "localhost"):
+    if not _request_is_local_or_authorized(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     global current_maintenance_id
     maintenance_id = body.maintenance_id or current_maintenance_id
@@ -452,8 +464,7 @@ async def maintenance_shutdown_endpoint(request: Request, body: MaintenanceReque
 @app.post("/api/control/announcement")
 async def announcement_endpoint(request: Request, body: AnnouncementRequest):
     """Send announcement to all connected agents. Localhost-only."""
-    client_host = request.client.host if request.client else ""
-    if client_host not in ("127.0.0.1", "::1", "localhost"):
+    if not _request_is_local_or_authorized(request):
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     await manager.broadcast_to_agents({
         "type": "announcement",
@@ -973,8 +984,9 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                                 contact_name = message.get("contact_name", "")
                                 contact_data = message.get("contact_data")
                                 
-                                database.log_disposition(
+                                call_id = database.log_disposition(
                                     {
+                                        "call_id": message.get("call_id"),
                                         "agent_id": agent_id,
                                         "phone": phone,
                                         "contact_name": contact_name,
@@ -985,6 +997,11 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                                         "contact_data": contact_data,
                                     }
                                 )
+                                await websocket.send_json({
+                                    "type": "call_logged",
+                                    "call_id": call_id,
+                                    "phone": phone,
+                                })
 
                                 # 2. Get Updated Stats for this agent
                                 new_stats = database.get_agent_stats(agent_id)
@@ -1011,12 +1028,14 @@ async def websocket_agent(websocket: WebSocket, agent_id: str):
                                 # Update existing call's disposition (user clicked disposition after call ended)
                                 # Only sent when client actually made a call; no fallback INSERT to avoid phantom calls
                                 disposition = message.get("disposition", "Unknown")
+                                call_id = message.get("call_id")
                                 phone = message.get("phone", "")
                                 contact_name = message.get("contact_name", "")
                                 notes = message.get("notes", "")
                                 contact_data = message.get("contact_data")
                                 updated = database.update_call_disposition(
                                     {
+                                        "call_id": call_id,
                                         "agent_id": agent_id,
                                         "phone": phone,
                                         "contact_name": contact_name,
@@ -1314,8 +1333,10 @@ def _introspect_task(task) -> dict:
 
 
 @app.get("/api/debug/status")
-async def debug_status():
+async def debug_status(request: Request):
     """Debug: agents, connections, asyncio task count and task list for visibility"""
+    if not _request_is_local_or_authorized(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
     task_list = []
     task_count = -1
     try:
@@ -1350,8 +1371,10 @@ async def debug_status():
 
 
 @app.post("/api/debug/disconnect_agent/{agent_id}")
-async def debug_disconnect_agent(agent_id: str):
+async def debug_disconnect_agent(agent_id: str, request: Request):
     """Debug: force-disconnect an agent's WebSocket (clears their connection/queue)"""
+    if not _request_is_local_or_authorized(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
     if agent_id not in manager.agent_connections:
         return {"ok": False, "error": "Agent not connected"}
     ws = manager.agent_connections[agent_id]
@@ -1365,8 +1388,10 @@ async def debug_disconnect_agent(agent_id: str):
 
 
 @app.post("/api/debug/disconnect_all_agents")
-async def debug_disconnect_all_agents():
+async def debug_disconnect_all_agents(request: Request):
     """Debug: force-disconnect all agent WebSockets"""
+    if not _request_is_local_or_authorized(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
     agent_ids = list(manager.agent_connections.keys())
     for aid in agent_ids:
         ws = manager.agent_connections.get(aid)
@@ -1476,10 +1501,10 @@ async def create_call(call: CallLogCreate):
             "campaign_mode": call.campaign_mode or "General",
         }
 
-        # Persist call log FIRST and return its ID
+        # Persist call log FIRST and return its stable call identifier
         call_id = database.create_call_record(db_data)
 
-        return {"id": call_id, "status": "created"}
+        return {"id": call_id, "call_id": call_id, "status": "created"}
     except Exception as e:
         print(f"CRITICAL: Failed to create call record: {e}")
         return JSONResponse(
@@ -1490,27 +1515,65 @@ async def create_call(call: CallLogCreate):
 
 
 @app.get("/api/export/{disposition_type}")
-async def export_csv(disposition_type: str, agent: str = None, format: str = None):
+async def export_csv(
+    disposition_type: str,
+    agent: str = None,
+    format: str = None,
+    start: str | None = None,
+    end: str | None = None,
+):
     """
     Download export of dispositions (xlsx with bold matching phone, or CSV if format=csv).
     Usage: /api/export/No Response or /api/export/ALL
     Optional: ?agent=AgentName or ?agent=ALL  and  ?format=csv for CSV instead of xlsx.
     """
     from urllib.parse import unquote
+    from datetime import datetime, time
 
     clean_type = unquote(disposition_type)
     agent_filter = unquote(agent) if agent else None
     use_xlsx = (format or "").lower() != "csv"
 
+    # Optional date range: expect YYYY-MM-DD; convert to inclusive timestamp bounds
+    start_ts = None
+    end_ts = None
+    try:
+        if start:
+            start_date = datetime.strptime(start, "%Y-%m-%d").date()
+            start_ts = datetime.combine(start_date, time.min).isoformat()
+        if end:
+            end_date = datetime.strptime(end, "%Y-%m-%d").date()
+            # inclusive end of day
+            end_ts = datetime.combine(end_date, time.max).isoformat()
+    except ValueError:
+        # If parsing fails, ignore date filters rather than breaking export
+        start_ts = None
+        end_ts = None
+
     if use_xlsx:
         try:
-            xlsx_io = database.export_dispositions_to_xlsx(clean_type, agent_id=agent_filter)
+            xlsx_io = database.export_dispositions_to_xlsx(
+                clean_type,
+                agent_id=agent_filter,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
             data = xlsx_io.getvalue()
         except Exception:
-            data = database.export_dispositions_to_csv(clean_type, agent_id=agent_filter).getvalue().encode("utf-8")
+            data = database.export_dispositions_to_csv(
+                clean_type,
+                agent_id=agent_filter,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            ).getvalue().encode("utf-8")
             use_xlsx = False
     else:
-        data = database.export_dispositions_to_csv(clean_type, agent_id=agent_filter).getvalue().encode("utf-8")
+        data = database.export_dispositions_to_csv(
+            clean_type,
+            agent_id=agent_filter,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        ).getvalue().encode("utf-8")
 
     filename = f"export_{clean_type}"
     if agent_filter and agent_filter != "ALL":
@@ -1525,6 +1588,25 @@ async def export_csv(disposition_type: str, agent: str = None, format: str = Non
     )
 # BASE_DIR is 'Backend', so we go up one level ('..') then into 'webupdates'
 WEB_UPDATES_DIR = os.path.join(BASE_DIR, "..", "webupdates")
+
+
+def _update_package_path() -> str:
+    primary = os.path.join(WEB_UPDATES_DIR, "client_package.zip")
+    if os.path.exists(primary):
+        return primary
+    fallback = os.path.join(WEB_UPDATES_DIR, "installer.zip")
+    return fallback
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 @app.get("/version.json")
 async def get_version_file():
@@ -1547,13 +1629,20 @@ async def get_newversion_file():
 @app.get("/client_package.zip")
 async def get_update_package():
     """Serve the update zip from the webupdates folder"""
-    # Note: launcher.py asks for 'client_package.zip'
-    file_path = os.path.join(WEB_UPDATES_DIR, "client_package.zip")
-    
-    # Fallback: check if you named it 'installer.zip' instead
-    if not os.path.exists(file_path):
-        file_path = os.path.join(WEB_UPDATES_DIR, "installer.zip")
-        
+    file_path = _update_package_path()
     if os.path.exists(file_path):
         return FileResponse(file_path, media_type="application/zip", filename="client_package.zip")
     return {"error": "Update package not found"}
+
+
+@app.get("/client_package.json")
+async def get_update_package_manifest():
+    """Serve update metadata including the current ZIP hash."""
+    file_path = _update_package_path()
+    if not os.path.exists(file_path):
+        return {"error": "Update package not found"}
+    return {
+        "filename": os.path.basename(file_path),
+        "sha256": _sha256_file(file_path),
+        "size": os.path.getsize(file_path),
+    }

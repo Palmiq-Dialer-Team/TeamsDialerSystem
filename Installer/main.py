@@ -45,6 +45,10 @@ from modules.settings_manager import SettingsManager
 from modules.session_manager import SessionManager
 from modules.filter_manager import FilterManager
 from modules.ai_core import AMDDetector, AMDState, analyze_buffered_audio, INVALID_NUMBER_PHRASES
+from modules.call_workflow_manager import CallWorkflowManager
+from modules.call_state import CallSessionState
+from modules.excel_import_worker import ExcelImportWorker
+from modules.message_dispatcher import QtMessageDispatcher
 import config
 
 # Dry run: test client-side AI transcription without hanging up or streaming audio to server
@@ -381,19 +385,27 @@ class SettingsDialog(QDialog):
             self.loopback_combo.addItem(name, idx)
 
         audio_cfg = self.settings_manager.get_audio_settings()
-        remember = audio_cfg.get("remember_audio_devices", False)
-        current_mic = audio_cfg.get("mic_index") if remember else None
-        current_loop = audio_cfg.get("loopback_index") if remember else None
+        current_mic = self.audio_capture.mic_device_index
+        current_loop = self.audio_capture.loopback_device_index
+        if current_mic is None:
+            current_mic = audio_cfg.get("mic_index")
+        if current_loop is None:
+            current_loop = audio_cfg.get("loopback_index")
 
-        self.set_combo_index(self.mic_combo, current_mic or self.audio_capture.mic_device_index)
-        self.set_combo_index(self.loopback_combo, current_loop or self.audio_capture.loopback_device_index)
+        self.set_combo_index(self.mic_combo, current_mic)
+        self.set_combo_index(self.loopback_combo, current_loop)
 
         layout.addRow("Microphone:", self.mic_combo)
         layout.addRow("System Audio (Stereo Mix):", self.loopback_combo)
 
         self.remember_audio_checkbox = QCheckBox("Remember preferred audio devices")
-        self.remember_audio_checkbox.setChecked(remember)
-        self.remember_audio_checkbox.setToolTip("When checked, your selections will be used on next launch. When unchecked, system defaults are used each time.")
+        # One-time action: users must explicitly check this on the save
+        # where they want to replace the remembered device pair.
+        self.remember_audio_checkbox.setChecked(False)
+        self.remember_audio_checkbox.setToolTip(
+            "When checked and saved, the selected mic and system audio devices are remembered for future launches. "
+            "If you leave it unchecked, saving other settings will not overwrite the devices already remembered."
+        )
         layout.addRow("", self.remember_audio_checkbox)
         
         volume_container = QHBoxLayout()
@@ -618,7 +630,12 @@ class SettingsDialog(QDialog):
         volume_value = self.volume_slider.value() / 10.0
         remember = self.remember_audio_checkbox.isChecked()
 
-        self.settings_manager.set_audio_settings(mic_idx, loop_idx, volume_value, remember=remember)
+        self.settings_manager.set_audio_settings(
+            mic_idx,
+            loop_idx,
+            volume_value,
+            remember=True if remember else None,
+        )
 
         self.audio_capture.mic_device_index = mic_idx
         self.audio_capture.loopback_device_index = loop_idx
@@ -1261,11 +1278,123 @@ class TeamsPowerDialerApp(QMainWindow):
     """Main app window."""
     ai_models_loaded_signal = pyqtSignal(object)
     tts_finished_signal = pyqtSignal()
+    request_import_signal = pyqtSignal(object, bool)
+
+    @property
+    def session(self):
+        return self.workflow_manager.session
+
+    @property
+    def call_status(self):
+        return self.session.status_text
+
+    @call_status.setter
+    def call_status(self, value):
+        self.workflow_manager.set_legacy_status(str(value))
+
+    @property
+    def is_autocalling_active(self):
+        return self.session.autocall_active
+
+    @is_autocalling_active.setter
+    def is_autocalling_active(self, value):
+        self.workflow_manager.set_autocall_active(bool(value))
+
+    @property
+    def _bot_initiated_hangup(self):
+        return self.session.bot_initiated_hangup
+
+    @_bot_initiated_hangup.setter
+    def _bot_initiated_hangup(self, value):
+        self.session.bot_initiated_hangup = bool(value)
+
+    @property
+    def _confirmed_human(self):
+        return self.session.confirmed_human
+
+    @_confirmed_human.setter
+    def _confirmed_human(self, value):
+        self.session.confirmed_human = bool(value)
+
+    @property
+    def waiting_for_disposition(self):
+        return self.session.waiting_for_disposition
+
+    @waiting_for_disposition.setter
+    def waiting_for_disposition(self, value):
+        self.session.waiting_for_disposition = bool(value)
+
+    @property
+    def _autocall_was_active_before_wait(self):
+        return self.session.autocall_resume_after_disposition
+
+    @_autocall_was_active_before_wait.setter
+    def _autocall_was_active_before_wait(self, value):
+        self.session.autocall_resume_after_disposition = bool(value)
+
+    @property
+    def _using_local_ai_this_call(self):
+        return self.session.using_local_ai
+
+    @_using_local_ai_this_call.setter
+    def _using_local_ai_this_call(self, value):
+        self.session.using_local_ai = bool(value)
+
+    @property
+    def timer_extended(self):
+        return self.session.timer_extended
+
+    @timer_extended.setter
+    def timer_extended(self, value):
+        self.session.timer_extended = bool(value)
+
+    @property
+    def _no_answer_handling(self):
+        return self.session.no_answer_handling
+
+    @_no_answer_handling.setter
+    def _no_answer_handling(self, value):
+        self.session.no_answer_handling = bool(value)
+
+    @property
+    def has_no_response_history(self):
+        return self.session.has_no_response_history
+
+    @has_no_response_history.setter
+    def has_no_response_history(self, value):
+        self.session.has_no_response_history = bool(value)
+
+    @property
+    def _call_record_created(self):
+        return self.session.call_record_created
+
+    @_call_record_created.setter
+    def _call_record_created(self, value):
+        self.session.call_record_created = bool(value)
+
+    @property
+    def current_call_id(self):
+        return self.session.call_id
+
+    @current_call_id.setter
+    def current_call_id(self, value):
+        self.session.call_id = value if value else None
+
+    @property
+    def current_ui_state(self):
+        return self.session.current_ui_state
+
+    @current_ui_state.setter
+    def current_ui_state(self, value):
+        self.session.current_ui_state = str(value)
     
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Teams Power Dialer")
         self.setGeometry(100, 100, 380, 850)
+
+        self.workflow_manager = CallWorkflowManager()
+        self.message_dispatcher = QtMessageDispatcher()
         
         self.excel_reader = ActiveExcelReader()
         self.teams_controller = TeamsController()
@@ -1281,7 +1410,7 @@ class TeamsPowerDialerApp(QMainWindow):
             agent_id = "unknown_agent"
         
         # LiveKit support has been fully removed; always use the WebSocket AudioStreamer.
-        self.streamer = AudioStreamer(config.SERVER_URL, agent_id=agent_id)
+        self.streamer = AudioStreamer(config.SERVER_URL, agent_id=agent_id, dispatcher=self.message_dispatcher)
         
         current_colors = self.settings_manager.get_colors()
         self.disposition_saver = DispositionSaver(
@@ -1332,10 +1461,6 @@ class TeamsPowerDialerApp(QMainWindow):
         self.history_stack = []  # Stack to track disposition actions for undo
         
         self._call_record_created = False
-        
-        self.message_timer = QTimer()
-        self.message_timer.timeout.connect(self.check_incoming_messages)
-        self.message_timer.start(100)  # Check every 100ms
         
         self.filter_timer = QTimer()
         self.filter_timer.timeout.connect(self.apply_filters)
@@ -1391,6 +1516,15 @@ class TeamsPowerDialerApp(QMainWindow):
         self.audio_capture.auto_select_devices()
         
         self.audio_capture.system_audio_multiplier = audio_cfg.get("system_audio_volume", 6.0)
+
+        self.import_thread = QThread(self)
+        self.import_worker = ExcelImportWorker()
+        self.import_worker.moveToThread(self.import_thread)
+        self.request_import_signal.connect(self.import_worker.import_contacts)
+        self.import_worker.finished.connect(self._on_import_worker_finished)
+        self.import_worker.error.connect(self._on_import_worker_error)
+        self.import_thread.start()
+        self._pending_import_context: Optional[Dict[str, Any]] = None
         
         self.statusBar().showMessage("Ready. Default audio devices selected. (Loading AI models in background...)")
         
@@ -1756,6 +1890,29 @@ class TeamsPowerDialerApp(QMainWindow):
         # Handle Teams connection/recording failures detected by TeamsController
         self.teams_controller.call_failed_signal.connect(self.handle_call_failure)
 
+        self.message_dispatcher.overdue_callbacks_received.connect(self.handle_overdue_callbacks)
+        self.message_dispatcher.callback_prompt_received.connect(self.handle_callback_prompt)
+        self.message_dispatcher.callback_created.connect(self._on_callback_created_message)
+        self.message_dispatcher.callback_updated.connect(
+            lambda message: print(f"Callback updated: {message.get('callback_id')}")
+        )
+        self.message_dispatcher.callback_cancelled.connect(
+            lambda message: print(f"Callback cancelled: {message.get('callback_id')}")
+        )
+        self.message_dispatcher.callback_logged.connect(
+            lambda message: print(f"Callback logged: {message.get('callback_id')}")
+        )
+        self.message_dispatcher.force_hangup_received.connect(self.handle_force_hangup)
+        self.message_dispatcher.ai_unavailable_received.connect(self.handle_ai_unavailable)
+        self.message_dispatcher.human_detected_received.connect(
+            lambda _message: self.statusBar().showMessage("Human detected - call connected")
+        )
+        self.message_dispatcher.announcement_received.connect(self.handle_announcement)
+        self.message_dispatcher.maintenance_warning_received.connect(self.handle_maintenance_warning)
+        self.message_dispatcher.maintenance_shutdown_received.connect(self.handle_maintenance_shutdown)
+        self.message_dispatcher.audio_ack_received.connect(self.handle_audio_ack)
+        self.message_dispatcher.call_logged.connect(self._on_call_logged_message)
+
     def on_call_connected(self):
         """
         Slot: called when TeamsController detects that the in-call timer has started.
@@ -1763,9 +1920,7 @@ class TeamsPowerDialerApp(QMainWindow):
         """
         import time
         self.actual_start_time = time.time()
-
-        self.streamer.register_message_handler("force_hangup", self.handle_force_hangup)
-        self.streamer.register_message_handler("audio_ack", self.handle_audio_ack)
+        self.workflow_manager.mark_call_connected(ai_monitoring=self.is_autocalling_active and self.amd_detector is not None)
     
     def set_ui_state_highlight(self, state, is_reminder=False):
         """
@@ -1862,26 +2017,14 @@ class TeamsPowerDialerApp(QMainWindow):
         if not self.contact_list:
             self.import_contacts()
             return
-        try:
-            df, _ = self.excel_reader.load_data_shadow_copy(visible_only=True)
-            sheet_name = None
-            if self.excel_reader.active_workbook:
-                try:
-                    sheet_name = self.excel_reader.active_workbook.ActiveSheet.Name
-                except Exception:
-                    pass
-            self.contact_list = self.excel_reader.process_contacts(df, sheet_name=sheet_name)
-            if not self.contact_list:
-                self.statusBar().showMessage("No visible contacts after filter. Try clearing Excel filter.")
-                return
-            self.current_index = 0
-            self.current_phone_idx = 0
-            self.display_current_contact()
-            self.apply_filters()
-            self.statusBar().showMessage(f"Refreshed: {len(self.contact_list)} visible contacts")
-        except Exception as e:
-            self.statusBar().showMessage(f"Refresh error: {e}")
-            print(f"Refresh error: {e}")
+        self._pending_import_context = {
+            "target_index": 0,
+            "target_sorts": None,
+            "visible_only": True,
+            "status_prefix": "Refreshed",
+        }
+        self.statusBar().showMessage("Refreshing Excel contacts in background...")
+        self.request_import_signal.emit(None, True)
 
     def import_contacts(self, target_index=None, target_sorts=None):
         """
@@ -1891,43 +2034,45 @@ class TeamsPowerDialerApp(QMainWindow):
         """
         if isinstance(target_index, bool):
             target_index = None
+        self._pending_import_context = {
+            "target_index": target_index,
+            "target_sorts": target_sorts,
+            "visible_only": False,
+            "status_prefix": "Loaded",
+        }
+        self.statusBar().showMessage("Importing contacts from Excel in background...")
+        self.request_import_signal.emit(None, False)
 
-        try:
-            df, _ = self.excel_reader.load_data_shadow_copy()
-
-            sheet_name = None
-            if self.excel_reader.active_workbook:
-                try:
-                    sheet_name = self.excel_reader.active_workbook.ActiveSheet.Name
-                except Exception:
-                    pass
-
-            self.contact_list = self.excel_reader.process_contacts(df, sheet_name=sheet_name)
-
-            if not self.contact_list:
+    def _on_import_worker_finished(self, result: Dict[str, Any]):
+        context = self._pending_import_context or {}
+        contacts = result.get("contacts", []) if isinstance(result, dict) else []
+        self.contact_list = contacts
+        if not self.contact_list:
+            if context.get("visible_only"):
+                self.statusBar().showMessage("No visible contacts after filter. Try clearing Excel filter.")
+            else:
                 self.statusBar().showMessage("No valid contacts found in Excel file (check headers: email, phone, first name, company)")
-                return
+            return
 
-            workbook_path = None
-            if self.excel_reader.active_workbook:
-                try:
-                    workbook_path = self.excel_reader.active_workbook.FullName
-                except Exception:
-                    pass
+        workbook_path = None
+        try:
+            workbook_path = self.excel_reader.get_active_file_path()
+        except Exception as e:
+            print(f"Error getting workbook path for disposition saver: {e}")
 
-            current_colors = self.settings_manager.get_colors()
-            self.disposition_saver = DispositionSaver(
-                config.ONEDRIVE_BASE_PATH,
-                active_workbook=self.excel_reader.active_workbook,
-                workbook_path=workbook_path,
-                colors=current_colors
-            )
+        current_colors = self.settings_manager.get_colors()
+        self.disposition_saver = DispositionSaver(
+            config.ONEDRIVE_BASE_PATH,
+            active_workbook=None,
+            workbook_path=workbook_path,
+            colors=current_colors
+        )
 
+        start_index = context.get("target_index")
+        target_sorts = context.get("target_sorts")
+        if start_index is None:
             start_index = 0
-
-            if target_index is not None:
-                start_index = target_index
-            elif workbook_path:
+            if workbook_path and not context.get("visible_only"):
                 history = self.session_manager.get_workbook_history(workbook_path)
                 if history:
                     saved_idx = history.get("current_index", 0)
@@ -1951,23 +2096,31 @@ class TeamsPowerDialerApp(QMainWindow):
                         else:
                             self.statusBar().showMessage("Starting from beginning")
 
-            self.current_index = start_index
-            self.current_phone_idx = 0
-            self.display_current_contact()
+        self.current_index = int(start_index or 0)
+        self.current_phone_idx = 0
+        if target_sorts:
+            self.filter_manager.active_sorts = target_sorts
+        self.display_current_contact()
+        self.apply_filters()
+        self._start_autosave_timer()
+        if hasattr(self, "resume_timer") and self.resume_timer.isActive():
+            self.resume_timer.stop()
+            if self.current_index >= len(self.contact_list):
+                self.current_index = 0
+                self.display_current_contact()
+            self.statusBar().showMessage(f"Session Resumed at #{self.current_index + 1}")
+            return
+        prefix = context.get("status_prefix", "Loaded")
+        if prefix == "Refreshed":
+            self.statusBar().showMessage(f"Refreshed: {len(self.contact_list)} visible contacts")
+        else:
             self.statusBar().showMessage(f"Loaded {len(self.contact_list)} contacts")
 
-            if target_sorts:
-                self.filter_manager.active_sorts = target_sorts
-
-            self.apply_filters()
-
-            self._start_autosave_timer()
-        
-        except Exception as e:
-            self.contact_list = []
-            self.clear_contact_display()
-            self.statusBar().showMessage(f"Import error: {e}")
-            print(f"Import error: {e}")
+    def _on_import_worker_error(self, error_message: str):
+        self.contact_list = []
+        self.clear_contact_display()
+        self.statusBar().showMessage(f"Import error: {error_message}")
+        print(f"Import error: {error_message}")
 
     def check_for_resume(self):
         """Check for resumable session, prompt if found."""
@@ -2018,18 +2171,6 @@ class TeamsPowerDialerApp(QMainWindow):
             t_idx = getattr(self, 'target_resume_index', 0)
             t_sorts = getattr(self, 'target_resume_sorts', None)
             self.import_contacts(target_index=t_idx, target_sorts=t_sorts)
-            
-            if self.contact_list:
-                self.resume_timer.stop()
-                
-                
-                if self.current_index >= len(self.contact_list):
-                    self.current_index = 0
-                    self.display_current_contact()
-                
-                self.statusBar().showMessage(f"Session Resumed at #{self.current_index + 1}")
-                return
-                
         except Exception:
             pass
 
@@ -2400,6 +2541,7 @@ class TeamsPowerDialerApp(QMainWindow):
         Clear any paused-autocall state and reset the button to its idle appearance.
         Used when the user navigates or manually overrides a 'Waiting for Disposition' pause.
         """
+        self.workflow_manager.clear_waiting_for_disposition()
         self.waiting_for_disposition = False
         self._confirmed_human = False
         self._autocall_was_active_before_wait = False
@@ -2597,6 +2739,7 @@ class TeamsPowerDialerApp(QMainWindow):
         
         # Trigger disposition highlight
         self.set_ui_state_highlight('DISPOSITION')
+        self.workflow_manager.mark_ended()
     
     def on_call_ended(self):
         """
@@ -2665,6 +2808,7 @@ class TeamsPowerDialerApp(QMainWindow):
 
                 payload = {
                     "type": "log_disposition",
+                    "call_id": self.current_call_id,
                     "agent_id": agent_id,
                     "phone": current_phone,
                     "contact_name": contact_name,
@@ -2709,6 +2853,7 @@ class TeamsPowerDialerApp(QMainWindow):
                 elif had_confirmed_human and not bot_initiated:
                     # Human was confirmed during this autocall session -> pause for manual disposition
                     print("[AI] Arbitrator: Human confirmed during call -> pause autocall for disposition")
+                    self.workflow_manager.mark_waiting_for_disposition(True)
                     self.waiting_for_disposition = True
                     self._autocall_was_active_before_wait = True
                     self.is_autocalling_active = False
@@ -2761,6 +2906,7 @@ class TeamsPowerDialerApp(QMainWindow):
         self._last_call_start_processed = now
 
         # Reset per-call human / disposition pause state
+        self.workflow_manager.begin_call(self.current_contact, self.current_phone_idx)
         self._confirmed_human = False
         self.waiting_for_disposition = False
         self._autocall_was_active_before_wait = False
@@ -2904,6 +3050,7 @@ class TeamsPowerDialerApp(QMainWindow):
             # If there is no usable name, fall through and just dial as usual.
 
         current_phone = phones[self.current_phone_idx]
+        self.workflow_manager.begin_call(self.current_contact, self.current_phone_idx)
 
         self.call_btn.setEnabled(False)
         self.call_status = "Dialing"
@@ -2938,6 +3085,7 @@ class TeamsPowerDialerApp(QMainWindow):
             # Automation worked (or active call window detected)
             import time
             self.call_start_time = time.time()
+            self.workflow_manager.mark_call_started()
             self.on_call_started()
 
             # Start monitoring the call window with timer callback.
@@ -2989,6 +3137,7 @@ class TeamsPowerDialerApp(QMainWindow):
         else:
             # Automation failed (timeout or could not detect call window/button)
             self.dot_animation_timer.stop()
+            self.workflow_manager.mark_error("teams_dial_failure")
             self.call_status = "Ready"
             self.call_status_label.setText("Call Failed (Teams Error)")
             self.call_status_label.setStyleSheet("color: #ff4444; font-weight: bold;")
@@ -3153,6 +3302,7 @@ class TeamsPowerDialerApp(QMainWindow):
                             duration = int(time.time() - self.call_start_time)
                         payload = {
                             "type": "update_disposition",
+                            "call_id": self.current_call_id,
                             "agent_id": agent_id,
                             "phone": self.phone_label.text(),
                             "contact_name": full_name,
@@ -3222,6 +3372,7 @@ class TeamsPowerDialerApp(QMainWindow):
                                 duration = int(time.time() - self.call_start_time)
                             self.streamer.send_json_message({
                                 "type": "update_disposition",
+                                "call_id": self.current_call_id,
                                 "agent_id": agent_id,
                                 "phone": self.phone_label.text(),
                                 "contact_name": full_name,
@@ -3320,6 +3471,7 @@ class TeamsPowerDialerApp(QMainWindow):
 
                 payload = {
                     "type": "update_disposition",
+                    "call_id": self.current_call_id,
                     "agent_id": agent_id,
                     "phone": self.phone_label.text(),
                     "contact_name": full_name,
@@ -3553,43 +3705,18 @@ class TeamsPowerDialerApp(QMainWindow):
         self.streamer.send_json_message({
             "type": "request_overdue_callbacks"
         })
-    
-    def check_incoming_messages(self):
-        """Check for incoming messages from server"""
-        message = self.streamer.get_message()
-        if message:
-            message_type = message.get("type")
-            
-            if message_type == "overdue_callbacks_list":
-                self.handle_overdue_callbacks(message.get("callbacks", []))
-            elif message_type == "show_callback_prompt":
-                self.handle_callback_prompt(message)
-            elif message_type == "callback_created":
-                callback_id = message.get('callback_id')
-                print(f"Callback created: {callback_id}")
-                # Update the most recent history item with the callback_id if it was a "Call Back Later"
-                if self.history_stack:
-                    last_item = self.history_stack[-1]
-                    if last_item.get('disposition') == "Call Back Later" and last_item.get('callback_id') is None:
-                        last_item['callback_id'] = callback_id
-            elif message_type == "callback_updated":
-                print(f"Callback updated: {message.get('callback_id')}")
-            elif message_type == "callback_cancelled":
-                print(f"Callback cancelled: {message.get('callback_id')}")
-            elif message_type == "callback_logged":
-                print(f"Callback logged: {message.get('callback_id')}")
-            elif message_type == "force_hangup":
-                self.handle_force_hangup(message)
-            elif message_type == "ai_unavailable":
-                self.handle_ai_unavailable(message)
-            elif message_type == "human_detected":
-                self.statusBar().showMessage("Human detected - call connected")
-            elif message_type == "announcement":
-                self.handle_announcement(message)
-            elif message_type == "maintenance_warning":
-                self.handle_maintenance_warning(message)
-            elif message_type == "maintenance_shutdown":
-                self.handle_maintenance_shutdown(message)
+
+    def _on_callback_created_message(self, message: Dict[str, Any]):
+        callback_id = message.get("callback_id")
+        print(f"Callback created: {callback_id}")
+        if self.history_stack:
+            last_item = self.history_stack[-1]
+            if last_item.get("disposition") == "Call Back Later" and last_item.get("callback_id") is None:
+                last_item["callback_id"] = callback_id
+
+    def _on_call_logged_message(self, message: Dict[str, Any]):
+        self.workflow_manager.sync_from_backend_message(message)
+        self.current_call_id = message.get("call_id")
     
     def handle_ai_unavailable(self, message):
         """Server reports AMD unavailable - no server-driven hangup. Client works like normal calling (AI off): user manually hangs up, logs disposition."""
@@ -3721,6 +3848,7 @@ class TeamsPowerDialerApp(QMainWindow):
         print("[AI] Human detected - Stopping AI")
         self._append_transcription_display("Human detected - Stopping AI")
         # Mark that this call had a confirmed human so the arbitrator can pause autocall
+        self.workflow_manager.mark_human_confirmed()
         self._confirmed_human = True
         if getattr(self, "no_answer_timer", None):
             self.no_answer_timer.stop()
@@ -3746,6 +3874,7 @@ class TeamsPowerDialerApp(QMainWindow):
         else:
             self.statusBar().showMessage(f"AI Hangup: {reason} -> Saved as 'No Response'")
             self._pending_force_hangup_disposition = "No Response"
+        self.workflow_manager.mark_hanging_up(self._pending_force_hangup_disposition)
 
         # Mark that this hangup was initiated by the bot/AI logic (not user)
         self._bot_initiated_hangup = True
@@ -3762,6 +3891,7 @@ class TeamsPowerDialerApp(QMainWindow):
         print("[Main] Connection failure detected - auto-dispositioning as No Response.")
         # Mark this as a bot/automation-initiated hangup so arbitrator treats it as auto-advance.
         self._bot_initiated_hangup = True
+        self.workflow_manager.mark_hanging_up("No Response")
         # Standardize as a no-answer style outcome.
         self._pending_force_hangup_disposition = "No Response"
         # Audio threads are no longer useful for this call; stop them.
@@ -3778,6 +3908,7 @@ class TeamsPowerDialerApp(QMainWindow):
         # Standardize all server-driven AI hangups as "No Response"
         self._pending_force_hangup_disposition = "No Response"
         self.statusBar().showMessage(f"AI (server) Hangup: {reason} -> Saved as 'No Response'")
+        self.workflow_manager.mark_hanging_up("No Response")
 
         # 1. Physically Hang Up Teams
         # Mark that this hangup was initiated by the server/bot
@@ -3807,6 +3938,7 @@ class TeamsPowerDialerApp(QMainWindow):
             return
         if not self.is_autocalling_active:
             return
+        self.workflow_manager.set_state(CallSessionState.AUTO_ADVANCING, status_text="Ready")
         if not self.current_contact:
             return
 
@@ -4349,6 +4481,9 @@ class TeamsPowerDialerApp(QMainWindow):
     def closeEvent(self, event):
         """Handle window close event"""
         self.stop_audio_threads()
+        if hasattr(self, "import_thread") and self.import_thread.isRunning():
+            self.import_thread.quit()
+            self.import_thread.wait(2000)
         event.accept()
 
 

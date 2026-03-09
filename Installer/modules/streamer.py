@@ -9,13 +9,19 @@ from typing import Dict, Any, Optional
 import numpy as np
 import config
 
+try:
+    from .message_dispatcher import QtMessageDispatcher
+except Exception:
+    QtMessageDispatcher = None
+
 
 class AudioStreamer:
     """WebSocket streamer for audio + metadata."""
     
-    def __init__(self, server_url: str, agent_id: str):
+    def __init__(self, server_url: str, agent_id: str, dispatcher: Optional["QtMessageDispatcher"] = None):
         self.server_url = server_url
         self.agent_id = agent_id
+        self.dispatcher = dispatcher
         self.websocket = None
         self.is_connected = False
         self.reconnect_attempts = 0
@@ -352,15 +358,10 @@ class AudioStreamer:
                         message_dict = json.loads(message)
                         message_type = message_dict.get("type")
                         
-                        # Put message in queue for main thread to process
+                        # Put message in queue for compatibility with older callers.
                         self.message_queue.put_nowait(message_dict)
-                        
-                        # Call registered callback if exists
-                        if message_type in self.message_callbacks:
-                            callback = self.message_callbacks[message_type]
-                            # Schedule callback in main thread (will be called from main.py)
-                            if callback:
-                                callback(message_dict)
+                        if self.dispatcher is not None:
+                            self.dispatcher.dispatch(message_dict)
                     
                     except json.JSONDecodeError:
                         # Not JSON, ignore
@@ -390,6 +391,10 @@ class AudioStreamer:
             callback: Callback function that takes message_dict as parameter
         """
         self.message_callbacks[message_type] = callback
+
+    def set_dispatcher(self, dispatcher: Optional["QtMessageDispatcher"]):
+        """Attach or replace the Qt-side inbound message dispatcher."""
+        self.dispatcher = dispatcher
     
     def send_json_message(self, message_dict: Dict[str, Any]):
         """

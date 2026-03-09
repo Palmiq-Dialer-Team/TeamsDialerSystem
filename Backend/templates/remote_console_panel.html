@@ -3,17 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <title>Remote Console</title>
-    <style>
-        body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
-        h1 { font-size: 1.4rem; margin-bottom: 16px; }
-        .actions { margin-bottom: 16px; display: flex; gap: 8px; }
-        button { padding: 8px 14px; border-radius: 0; border: 1px solid #444; cursor: pointer; font-weight: 600; background: #1f1f1f; color: #eee; }
-        button:hover { background: #2d2d2d; color: #fff; }
-        .log-container { background: #1f1f1f; border-radius: 0; padding: 8px; max-height: 70vh; overflow-y: auto; font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; border: 1px solid #333; }
-        .status { font-size: 0.9rem; color: #ccc; margin-bottom: 8px; }
-    </style>
+    <link rel="stylesheet" href="/static/css/shared.css">
+    <link rel="stylesheet" href="/static/css/remote_console.css">
 </head>
-<body>
+<body class="remote-console-panel">
     <h1>Remote Console</h1>
     <div class="status">Authenticated. Use with care.</div>
     <div class="actions">
@@ -31,64 +24,9 @@
     <div id="log-container" class="log-container">Loading logs...</div>
 
     <script>
-        const csrfToken = "{{ csrf_token }}";
-
-        async function loadLogs() {
-            try {
-                const res = await fetch('/remote-console/logs?lines=200', { cache: 'no-store' });
-                if (!res.ok) {
-                    document.getElementById('log-container').textContent = 'Unable to load logs (' + res.status + ').';
-                    return;
-                }
-                const data = await res.json();
-                const lines = data.lines || [];
-                document.getElementById('log-container').textContent = lines.join('');
-            } catch (e) {
-                document.getElementById('log-container').textContent = 'Error loading logs: ' + e;
-            }
-        }
-
-        async function postConsoleAction(url, confirmMessage, redirectToLogin) {
-            if (!confirm(confirmMessage)) {
-                return;
-            }
-            const statusEl = document.getElementById('action-status');
-            statusEl.textContent = 'Sending request...';
-
-            try {
-                const res = await fetch(url, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: new URLSearchParams({ csrf_token: csrfToken })
-                });
-
-                let data = {};
-                try {
-                    data = await res.json();
-                } catch (e) {
-                    // Non-JSON response (e.g., on shutdown), ignore parse error
-                }
-
-                statusEl.textContent = 'Response ' + res.status +
-                    (data.returncode !== undefined ? ', return code: ' + data.returncode : '');
-
-                // Refresh logs so the appended output is visible quickly
-                loadLogs();
-
-                // Optional redirect after successful restart
-                if (redirectToLogin && res.ok) {
-                    setTimeout(function () {
-                        window.location.href = '/remote-console/login';
-                    }, 1000);
-                }
-            } catch (e) {
-                statusEl.textContent = 'Request failed: ' + e;
-            }
-        }
-
-        loadLogs();
-        setInterval(loadLogs, 5000);
+        window.CSRF_TOKEN = "{{ csrf_token }}";
     </script>
+    <script src="/static/js/remote_console.js" defer></script>
 </body>
 </html>
 

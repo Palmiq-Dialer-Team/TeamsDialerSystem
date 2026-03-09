@@ -1,0 +1,36 @@
+body {
+    font-family: sans-serif;
+    background: #1a1a1a;
+    color: #e0e0e0;
+    margin: 20px;
+}
+
+h1 {
+    font-size: 1.2rem;
+}
+
+a {
+    color: #007bff;
+}
+
+.status {
+    margin: 10px 0;
+    padding: 8px;
+    background: #2d2d2d;
+    border-radius: 4px;
+}
+
+.log {
+    max-height: 200px;
+    overflow-y: auto;
+    font-size: 0.85rem;
+    font-family: monospace;
+    background: #111;
+    padding: 10px;
+    border-radius: 4px;
+}
+
+.log div {
+    margin: 2px 0;
+}
+

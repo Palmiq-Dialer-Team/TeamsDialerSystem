@@ -1,0 +1,104 @@
+body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #111;
+    color: #eee;
+    margin: 0;
+}
+
+/* Panel layout */
+body.remote-console-panel {
+    padding: 16px;
+}
+
+/* Login layout */
+body.remote-console-login {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+}
+
+h1 {
+    font-size: 1.4rem;
+    margin-bottom: 16px;
+}
+
+.actions {
+    margin-bottom: 16px;
+    display: flex;
+    gap: 8px;
+}
+
+button {
+    padding: 8px 14px;
+    border-radius: 0;
+    border: 1px solid #444;
+    cursor: pointer;
+    font-weight: 600;
+    background: #1f1f1f;
+    color: #eee;
+}
+
+button:hover {
+    background: #2d2d2d;
+    color: #fff;
+}
+
+.log-container {
+    background: #1f1f1f;
+    border-radius: 0;
+    padding: 8px;
+    max-height: 70vh;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    border: 1px solid #333;
+}
+
+.status {
+    font-size: 0.9rem;
+    color: #ccc;
+    margin-bottom: 8px;
+}
+
+.card {
+    background: #1f1f1f;
+    padding: 24px 28px;
+    border-radius: 0;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+    width: 320px;
+    border: 1px solid #333;
+}
+
+label {
+    display: block;
+    margin-top: 12px;
+    font-size: 0.9rem;
+    color: #ccc;
+}
+
+input[type="password"],
+input[type="text"] {
+    width: 100%;
+    padding: 8px;
+    margin-top: 4px;
+    border-radius: 0;
+    border: 1px solid #444;
+    background: #111;
+    color: #eee;
+    box-sizing: border-box;
+}
+
+.error {
+    color: #ccc;
+    font-size: 0.85rem;
+    margin-top: 8px;
+}
+
+.hint {
+    font-size: 0.8rem;
+    color: #888;
+    margin-top: 8px;
+}
+

@@ -4,59 +4,8 @@
     <meta charset="UTF-8">
     <title>Admin Command Center</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
-    <style>
-        :root { --bg: #1a1a1a; --card: #2d2d2d; --accent: #007bff; --text: #e0e0e0; }
-        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; display: flex; height: 100vh; }
-        
-        /* Sidebar for Exports */
-        .sidebar { width: 250px; background: #222; padding: 20px; border-right: 1px solid #333; display: flex; flex-direction: column; }
-        .sidebar h2 { font-size: 1.2rem; color: #888; text-transform: uppercase; letter-spacing: 1px; }
-        .export-btn { 
-            background: #333; color: white; border: 1px solid #444; 
-            padding: 10px; margin-bottom: 8px; cursor: pointer; text-align: left; border-radius: 4px; transition: 0.2s;
-        }
-        .export-btn:hover { background: var(--accent); border-color: var(--accent); }
-        
-        /* Main Content */
-        .main { flex: 1; padding: 30px; overflow-y: auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
-        
-        /* Agent Grid */
-        .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }
-        
-        /* Agent Card Design */
-        .agent-card { 
-            background: var(--card); border-radius: 12px; padding: 20px; 
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3); border: 1px solid #333;
-            transition: transform 0.2s; position: relative;
-        }
-        .agent-card:hover { transform: translateY(-2px); border-color: #555; }
-        
-        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
-        .agent-name { font-size: 1.4rem; font-weight: 800; }
-        .status-badge { padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; }
-        .status-connected { background: rgba(46, 234, 144, 0.2); color: #2eea90; border: 1px solid #2eea90; }
-        .status-disconnected { background: rgba(255, 69, 58, 0.2); color: #ff453a; border: 1px solid #ff453a; }
-        
-        .live-info { background: #222; padding: 10px; border-radius: 6px; margin-bottom: 15px; }
-        .info-row { display: flex; justify-content: space-between; font-size: 0.9rem; margin-bottom: 5px; }
-        .label { color: #888; }
-        
-        .stats-row { display: flex; gap: 10px; margin-top: 15px; border-top: 1px solid #444; padding-top: 15px; }
-        .stat-box { flex: 1; text-align: center; }
-        .stat-num { display: block; font-size: 1.5rem; font-weight: 800; color: white; }
-        .stat-label { font-size: 0.75rem; color: #888; text-transform: uppercase; }
-        
-        .listen-btn { 
-            width: 100%; padding: 12px; margin-top: 15px; border: none; border-radius: 6px; 
-            background: var(--accent); color: white; font-weight: 600; cursor: pointer; 
-            position: relative; z-index: 10; pointer-events: auto;
-        }
-        .listen-btn.active { background: #2eea90; animation: pulse 1.5s infinite; }
-        .listen-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
-    </style>
+    <link rel="stylesheet" href="/static/css/shared.css">
+    <link rel="stylesheet" href="/static/css/dashboard.css">
 </head>
 <body>
 
@@ -70,22 +19,34 @@
             <option value="ALL">All Agents</option>
         </select>
         
-        <button class="export-btn" onclick="exportData('Booked Meeting')">💰 Export "Booked Meeting"</button>
-        <button class="export-btn" onclick="exportData('No Response')">📄 Export "No Response"</button>
-        <button class="export-btn" onclick="exportData('Sent Info')">📤 Export "Sent Info"</button>
-        <button class="export-btn" onclick="exportData('Not Interested')">📄 Export "Not Interested"</button>
-        <button class="export-btn" onclick="exportData('Call Back Later')">⏰ Export "Call Backs"</button>
-        <button class="export-btn" onclick="exportData('Wrong Number')">❌ Export "Wrong Number"</button>
-        <button class="export-btn" onclick="exportData('Voicemail (Verified)')">📞 Export "Voicemail (Verified)"</button>
-        <button class="export-btn" onclick="exportData('Invalid Contact')">⚠️ Export "Invalid Contact"</button>
+        <div style="margin-bottom: 10px;">
+            <label style="font-size: 0.85rem; color: #aaa; display: block; margin-bottom: 4px;">Date range:</label>
+            <input type="date" id="exportStart" style="width: 100%; padding: 6px; margin-bottom: 6px; background: #333; color: white; border: 1px solid #444; border-radius: 4px; font-size: 0.85rem;">
+            <input type="date" id="exportEnd" style="width: 100%; padding: 6px; background: #333; color: white; border: 1px solid #444; border-radius: 4px; font-size: 0.85rem;">
+        </div>
+        <div style="display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 16px;">
+            <button class="export-btn" style="flex: 1 1 48%; font-size: 0.75rem; padding: 6px;" onclick="setQuickRange('today')">Today</button>
+            <button class="export-btn" style="flex: 1 1 48%; font-size: 0.75rem; padding: 6px;" onclick="setQuickRange('7d')">Last 7 Days</button>
+            <button class="export-btn" style="flex: 1 1 48%; font-size: 0.75rem; padding: 6px;" onclick="setQuickRange('month')">This Month</button>
+            <button class="export-btn" style="flex: 1 1 48%; font-size: 0.75rem; padding: 6px;" onclick="setQuickRange('all')">All Time</button>
+        </div>
+        
+        <button class="export-btn" onclick="exportData('Booked Meeting')">Export “Booked Meeting”</button>
+        <button class="export-btn" onclick="exportData('No Response')">Export “No Response”</button>
+        <button class="export-btn" onclick="exportData('Sent Info')">Export “Sent Info”</button>
+        <button class="export-btn" onclick="exportData('Not Interested')">Export “Not Interested”</button>
+        <button class="export-btn" onclick="exportData('Call Back Later')">Export “Call Backs”</button>
+        <button class="export-btn" onclick="exportData('Wrong Number')">Export “Wrong Number”</button>
+        <button class="export-btn" onclick="exportData('Voicemail (Verified)')">Export “Voicemail (Verified)”</button>
+        <button class="export-btn" onclick="exportData('Invalid Contact')">Export “Invalid Contact”</button>
         <hr style="border-color: #333; width: 100%;">
-        <button class="export-btn" onclick="exportData('ALL')">📦 Export FULL Database</button>
+        <button class="export-btn" onclick="exportData('ALL')">Export full database</button>
     </div>
 
     <!-- Main Dashboard -->
     <div class="main">
         <div class="header">
-            <h1>📞 Live Operations Floor</h1>
+            <h1>Live operations</h1>
             <div id="connection-status" style="color: #888;">
                 <a href="/remote-console/login" title="Remote console (password protected)" style="text-decoration: none;">🟢</a>
                 <span id="connection-status-text">Connecting to server...</span>
@@ -149,13 +110,67 @@
         function exportData(type) {
             const agentFilter = document.getElementById('agentExportFilter');
             const selectedAgent = agentFilter ? agentFilter.value : 'ALL';
+            const startInput = document.getElementById('exportStart');
+            const endInput = document.getElementById('exportEnd');
+            const start = startInput && startInput.value ? startInput.value : null; // YYYY-MM-DD
+            const end = endInput && endInput.value ? endInput.value : null;
             
             let url = `/api/export/${encodeURIComponent(type)}`;
+            const params = [];
             if (selectedAgent && selectedAgent !== 'ALL') {
-                url += `?agent=${encodeURIComponent(selectedAgent)}`;
+                params.push(`agent=${encodeURIComponent(selectedAgent)}`);
+            }
+            if (start) {
+                params.push(`start=${encodeURIComponent(start)}`);
+            }
+            if (end) {
+                params.push(`end=${encodeURIComponent(end)}`);
+            }
+            if (params.length > 0) {
+                url += `?${params.join('&')}`;
+            }
+            window.location.href = url;
+        }
+        
+        function setQuickRange(preset) {
+            const startInput = document.getElementById('exportStart');
+            const endInput = document.getElementById('exportEnd');
+            const today = new Date();
+            
+            function formatDate(d) {
+                const year = d.getFullYear();
+                const month = String(d.getMonth() + 1).padStart(2, '0');
+                const day = String(d.getDate()).padStart(2, '0');
+                return `${year}-${month}-${day}`;
             }
             
-            window.location.href = url;
+            if (preset === 'all') {
+                startInput.value = '';
+                endInput.value = '';
+                return;
+            }
+            
+            if (preset === 'today') {
+                const d = formatDate(today);
+                startInput.value = d;
+                endInput.value = d;
+                return;
+            }
+            
+            if (preset === '7d') {
+                const endDate = new Date(today);
+                const startDate = new Date(today);
+                startDate.setDate(startDate.getDate() - 6); // include today + previous 6 days
+                startInput.value = formatDate(startDate);
+                endInput.value = formatDate(endDate);
+                return;
+            }
+            
+            if (preset === 'month') {
+                const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+                startInput.value = formatDate(firstDay);
+                endInput.value = formatDate(today);
+            }
         }
 
         ws.onopen = () => {
@@ -431,5 +446,6 @@
             }).catch(e => console.error("Audio Decode Error:", e));
         }
     </script>
+    <script src="/static/js/dashboard.js" defer></script>
 </body>
 </html>

@@ -8,6 +8,128 @@ Version numbering: from version 1.9.9 onward we use x.y.z (e.g. 1.9.11, 1.9.12).
 
 ---
 
+## Version 2.1.0
+
+### Status
+- First “hardening” release after 2.0.x: moves the Installer away from a single god-script window into a **state-driven workflow core** with safer threading, COM handling, and backend identity/persistence.
+- Focus areas:
+  - Structural decoupling and explicit call-session state.
+  - Thread-safe websocket/UI boundaries.
+  - SQLite identity and connection lifecycle.
+  - Excel COM stability during dispositions.
+  - Basic admin surface + updater integrity hardening.
+
+### Installer – structural refactor (CallWorkflowManager, CallSession)
+- Introduced a formal call-session model in `Installer/modules/call_state.py`, `call_session.py`, and `call_workflow_manager.py`:
+  - `CallSessionState` enum (IDLE, READY, DIALING, CALLING, CONNECTED, AMD_MONITORING, HUMAN_CONFIRMED, DISPOSITION_PENDING, AUTO_ADVANCING, HANGING_UP, ENDED, ERROR).
+  - `CallSession` dataclass as the **single source of truth** for per-call/per-session flags (autocall active, waiting_for_disposition, bot_initiated_hangup, confirmed_human, has_no_response_history, call_id, etc.).
+  - `CallWorkflowManager` owns all transitions (`begin_call`, `mark_call_started`, `mark_call_connected`, `mark_waiting_for_disposition`, `mark_hanging_up`, `mark_ended`, `set_autocall_active`, `clear_waiting_for_disposition`).
+- `TeamsPowerDialerApp` in `Installer/main.py` now:
+  - Holds a `workflow_manager` rather than keeping all flags on the window.
+  - Exposes thin property proxies (`call_status`, `is_autocalling_active`, `_bot_initiated_hangup`, `_confirmed_human`, `waiting_for_disposition`, `_autocall_was_active_before_wait`, `_no_answer_handling`, `has_no_response_history`, `_call_record_created`, `current_call_id`, `current_ui_state`) that simply read/write the `CallSession`.
+  - Uses these transitions inside `start_call`, `on_call_started`, `on_call_connected`, `on_call_ended`, `handle_human_detected`, `handle_local_hangup`, `handle_force_hangup`, `_process_no_answer_automation`, and `handle_disposition`.
+- Result: the Installer’s call lifecycle is now explicit, testable, and no longer depends on scattered booleans on the main window.
+
+### Installer – thread-safe messaging (QtMessageDispatcher)
+- Added `Installer/modules/message_dispatcher.py` with `QtMessageDispatcher` (QObject) that:
+  - Receives parsed websocket messages from the streamer thread and re-emits them as Qt signals on the **main thread** (`force_hangup_received`, `ai_unavailable_received`, `human_detected_received`, `announcement_received`, `maintenance_warning_received`, `maintenance_shutdown_received`, `callback_*`, `audio_ack_received`, `call_logged`, etc.).
+- Updated `Installer/modules/streamer.py`:
+  - `AudioStreamer` now accepts an optional dispatcher and calls `dispatcher.dispatch(message_dict)` from `_message_receiver_loop`.
+  - Direct UI callbacks from the websocket thread were removed; all UI side-effects now flow through Qt signals.
+- `TeamsPowerDialerApp.setup_connections` wires dispatcher signals to slots like `handle_force_hangup`, `handle_ai_unavailable`, `handle_announcement`, `handle_maintenance_warning`, `handle_maintenance_shutdown`, `handle_callback_prompt`, `_on_callback_created_message`, `_on_call_logged_message`.
+- Result: websocket handling is now **Qt-thread safe**, duplicated inbound paths have been removed, and message delivery is easier to reason about.
+
+### Installer – Excel COM stability and background import
+- Introduced `Installer/modules/excel_import_worker.py` (`ExcelImportWorker`):
+  - Lives in its own `QThread`, calls `pythoncom.CoInitialize()` in the worker thread, then uses a private `ActiveExcelReader` to load data.
+  - Emits only plain Python data back to the UI (`contacts`, `sheet_name`, `row_count`), avoiding COM objects crossing threads.
+- `TeamsPowerDialerApp`:
+  - Uses `ExcelImportWorker` via a `request_import_signal` and `_on_import_worker_finished` / `_on_import_worker_error`.
+  - Re-acquires the workbook path on the main thread (`ActiveExcelReader.get_active_file_path()`) and passes only `workbook_path` into `DispositionSaver`.
+- `DispositionSaver`:
+  - Continues to use `_get_workbook_in_thread()` to reattach to Excel by path inside its own background threads (`save_contact_async`, `save_workbook_async`, `delete_phone_number_from_source`).
+  - `_bring_excel_to_foreground` is now a no-op to prevent zombie Excel windows caused by repeated `Application.Visible` changes.
+- Result: importing contacts and saving dispositions no longer blocks the UI or causes COM “marshalled for a different thread” errors; Excel windows stay stable during high-volume disposition activity.
+
+### Installer – client-side AI lifecycle tweaks
+- `Installer/modules/ai_core.py`:
+  - `AMDDetector` now preloads a **shared Silero VAD model** once (`_ensure_vad`) and returns per-call deep-copied VAD instances via `get_new_vad_model()`, falling back to a fresh load only if deepcopy fails.
+  - Whisper model usage is unchanged: one shared `tiny.en` CPU `WhisperModel` with the tuned decoding parameters (beam_size, best_of, temperature ladder).
+- `CLIENT_SIDE_AI.md` and `AUTOCALL_WORKFLOW.md`:
+  - Updated to document the new AMDWorker wiring, shared VAD/Whisper lifecycle, and the formal `CallSessionState` transitions (with mermaid state diagrams).
+
+### Backend – call identity and DB connection helper
+- `Backend/database.py`:
+  - Added a stable `call_id` column to the `calls` table and backfilled missing values with UUIDs (`_ensure_call_ids_impl`).
+  - `log_call`, `log_disposition`, and `create_call_record` now:
+    - Accept or generate a UUID `call_id`.
+    - Insert `call_id` alongside agent/phone/disposition data.
+    - Return the `call_id` to callers.
+  - `update_call_disposition`:
+    - Now prefers an explicit `call_id` when supplied.
+    - Falls back to the previous heuristic (most recent row for agent+phone within a time window) only when no `call_id` is provided.
+- `Backend/db_connection.py`:
+  - New helpers `get_connection(DB_PATH)` and `get_readonly_connection(DB_PATH)` wrap `sqlite3.connect(...)` with:
+    - `row_factory = sqlite3.Row`, `busy_timeout`, and consistent commit/rollback semantics.
+  - `database.py` was refactored to use these helpers for connection lifecycle instead of scattered `sqlite3.connect(...)` calls.
+- `Backend/main.py`:
+  - `POST /api/calls` now returns `{"id": call_id, "call_id": call_id, "status": "created"}` to the Installer.
+  - WebSocket disposition paths (`log_disposition`, `update_disposition`) accept and pass along `call_id` to database helpers.
+- Installer–Backend integration:
+  - Installer stores the returned `call_id` in `CallSession` and uses it for all subsequent `log_disposition` / `update_disposition` messages.
+  - `CallWorkflowManager.sync_from_backend_message` handles `{"type": "call_logged", "call_id": ...}` to keep session and DB identity in sync.
+
+### Backend – WAL-safe snapshots and admin surface hardening
+- `Backend/control_panel/db_viewer.py`:
+  - Switched snapshot creation from `shutil.copy2` to the official SQLite backup API:
+    - Opens a live connection to the main DB and backs it up into a snapshot DB using `source.backup(dest)`.
+    - This correctly incorporates WAL state and avoids stale or corrupt snapshots under concurrent writes.
+- `Backend/control_panel/config.py`, `app.py`, `server_controller.py`, `db_viewer.py`:
+  - Introduced `INTERNAL_API_TOKEN` (optional env var) and `build_auth_headers()` helper.
+  - Control panel now passes this token in `Authorization: Bearer ...` headers when calling:
+    - `/api/debug/status`
+    - `/api/debug/disconnect_agent/{agent_id}`
+    - `/api/debug/disconnect_all_agents`
+    - `/api/control/shutdown`
+    - `/api/control/maintenance_warning`
+    - `/api/control/maintenance_shutdown`
+    - `/api/control/announcement`
+- `Backend/main.py`:
+  - Added `_request_is_local_or_authorized(request)` to gate:
+    - All `/api/debug/*` endpoints.
+    - All `/api/control/*` endpoints (shutdown, maintenance, announcements).
+  - This keeps localhost‑only behavior by default, with the option to authorize remote control tools via a simple Bearer token.
+
+### Dashboard & admin UI – layout and static assets
+- Updated the **Exports** section on the main dashboard (`Backend/templates/dashboard.html`) to make time filtering and actions clearer:
+  - Added calendar-style date pickers for the **from / to** range so admins can more easily select export windows without typing ISO timestamps.
+  - Clarified the export controls and labels so it is more obvious which downloads respect the selected date range and which are “export all” style.
+  - Minor layout and copy tweaks to keep the export tools consistent with the hardened backend export rules (dedupe, disposition filtering).
+- Introduced a shared static asset layout in `Backend/static/` and mounted it in `Backend/main.py` as `/static`:
+  - Moved inline CSS/JS from `Backend/templates/dashboard.html`, `remote_console_panel.html`, `remote_console_login.html`, and `audio_test.html` into `static/css/*.css` and `static/js/*.js` while keeping all behavior identical (including CSRF handling for the remote console).
+  - Normalized the dark-theme styles across dashboard, remote console, and audio-test pages so they share a single base palette and typography.
+  - Fixed the dashboard layout regression caused by the static split so the **Data Export** sidebar and **Live operations** agent grid once again sit side-by-side (flex layout on the dashboard body), matching the pre-refactor appearance.
+
+### Installer & Backend – updater integrity
+- `Backend/main.py`:
+  - Added `/client_package.json` manifest endpoint that returns:
+    - The update ZIP filename.
+    - Its SHA-256 hash.
+    - Its file size.
+  - Reused the existing `/client_package.zip` endpoint but now through a helper that determines the active ZIP path and is shared with the manifest.
+- `Installer/launcher.py`:
+  - On update:
+    - Fetches `client_package.json` (when available), then downloads `client_package.zip`.
+    - Computes the local SHA-256 of `update.zip` and compares it to the server manifest before installing.
+    - Refuses to install if the hash does not match.
+  - Enforces safe extraction:
+    - Rejects archive members with unsafe paths (absolute, parent-directory traversal, drive-qualified).
+    - Writes each file through a controlled path, honoring `PROTECTED_FILES`.
+  - Reduces redundant `pip install -r requirements.txt` calls:
+    - Computes a hash of `requirements.txt` and only runs pip when that hash changes, recording it in `.requirements.sha256`.
+
+---
+
 ## Version 2.0.9
 
 ### Autocall and in-call UX

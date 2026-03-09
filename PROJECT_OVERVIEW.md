@@ -2,11 +2,10 @@
 
 TeamsPowerDialer helps agents call through Excel lead lists using Microsoft Teams and log what happened on each call.
 
-- The Installer client reads contacts from Excel, places calls in Teams, and records dispositions. In v2.0.0 it runs client-side answering-machine detection (AMD) when Start Auto-Call is on: Silero VAD + faster-whisper run locally; no audio is streamed to the server for AMD in that mode.
-- The Backend server receives metadata and disposition data, stores calls and callbacks in SQLite, and exposes dashboard, exports, and APIs. It no longer needs to run AMD for the production dialer; it focuses on storage, dashboards, and control endpoints.
-- LiveKit is optional and not required for the production dialer; it remains available for experimentation.
+- The Installer client reads contacts from Excel, places calls in Teams, and records dispositions. From v2.0.0 onward it runs client-side answering-machine detection (AMD) when Start Auto-Call is on (Silero VAD + faster-whisper locally, no audio streamed to the server for AMD), and from v2.1.0 it uses a **state-driven call/session core** (`CallWorkflowManager` + `CallSession`) instead of a single “god” window.
+- The Backend server receives metadata and disposition data, stores calls and callbacks in SQLite, and exposes dashboard, exports, and APIs. It no longer runs AMD for the production dialer; instead, v2.1.0 adds **stable call identifiers**, a shared DB connection helper, WAL-safe snapshots, and token-protected admin/debug endpoints.
 
-Current phase: v2.0.0 with client-side AI is in production. See `HISTORY.md` and `IN_DEVELOPMENT.md` for details.
+Current phase: v2.1.0 “hardening” release — client-side AI in production plus Installer refactor and backend identity/persistence/security improvements. See `HISTORY.md` and `IN_DEVELOPMENT.md` for details.
 
 This document is a short guide for developers to understand how the pieces fit together.
 
@@ -18,21 +17,28 @@ This document is a short guide for developers to understand how the pieces fit t
   - PyQt desktop app for agents.
   - Reads contacts from the active Excel workbook.
   - Automates Teams to dial numbers.
-  - Client-side AMD (v2.0.0): when Start Auto-Call is on, runs Silero VAD + faster-whisper locally (`Installer/modules/ai_core.py`); decides human vs voicemail / bot / invalid-number and triggers hangup + auto-advance. Sends metadata and call_started to the Backend; does not stream audio to the server for AMD in this mode.
-  - Can still stream audio over WebSocket (or LiveKit if enabled) for dashboards or legacy paths.
-  - Writes dispositions back into Excel and sends them to the Backend.
+   - Client-side AMD (v2.0.x): when Start Auto-Call is on, runs Silero VAD + faster-whisper locally (`Installer/modules/ai_core.py`); decides human vs voicemail / bot / invalid-number and triggers hangup + auto-advance. Sends metadata and `call_started` to the Backend; does not stream audio to the server for AMD in this mode.
+   - From v2.1.0:
+     - Uses `CallWorkflowManager` + `CallSession` to track call lifecycle (READY, DIALING, CALLING, CONNECTED, AMD_MONITORING, DISPOSITION_PENDING, AUTO_ADVANCING, ENDED, etc.).
+     - Uses `QtMessageDispatcher` so all inbound websocket messages are delivered as Qt signals on the main thread instead of calling UI callbacks from the asyncio loop.
+     - Uses an `ExcelImportWorker` (COM-initialized worker thread) to read large Excel files without freezing the UI, and `DispositionSaver` reattaches to Excel by path inside its own background threads.
+   - Can still stream audio over WebSocket (or LiveKit if enabled) for dashboards or legacy paths.
+   - Writes dispositions back into Excel and sends them to the Backend.
 
 - Backend (`Backend/`)
   - FastAPI app with a WebSocket endpoint for audio / metadata.
   - Persists calls and callbacks in `teams_dialer.db` (SQLite).
   - Exposes JSON APIs for stats, exports, and dashboard.
+  - From v2.1.0:
+    - Uses stable UUID-style `call_id` values for all calls and prefers `call_id` for disposition updates (with heuristics as a compatibility fallback).
+    - Wraps SQLite connections in `db_connection.get_connection()` / `get_readonly_connection()` to centralize timeouts, row factories, and commit/rollback behavior.
+    - Uses SQLite’s backup API for control-panel snapshot creation (WAL-safe).
+    - Protects `/api/debug/*` and `/api/control/*` endpoints with localhost or an optional `INTERNAL_API_TOKEN` (Bearer auth), which the control panel now forwards automatically.
+    - Serves a `/client_package.json` manifest so the Installer launcher can verify update ZIP hashes before installing.
+    - Serves versioned static assets under `/static` (CSS/JS) so the dashboard, audio-test page, and remote console templates can keep their HTML structure small while sharing a consistent dark theme and JavaScript behavior.
 
 - Control Panel (`Backend/control_panel/`)
   - Tkinter app to start/stop the server, view logs, and open a read‑only DB snapshot viewer.
-
-- LiveKit (`LiveKit/`)
-  - Optional WebRTC audio path.
-  - `start_livekit.bat` starts `livekit-server` with `config.yaml`.
 
 ---
 
@@ -72,7 +78,6 @@ This document is a short guide for developers to understand how the pieces fit t
 `Installer/config.py` holds local settings:
 - Excel file location.
 - Backend URLs (`SERVER_URL`, `SERVER_API_URL`).
-- Optional LiveKit URL for WebRTC audio (`LIVEKIT_URL`, server IP + port 81).
 
 The launcher (`Installer/launcher.py`) checks for updates from `UPDATE_URL`, but it does **not** overwrite `config.py` once it exists locally (it is treated as a local config file).
 
@@ -84,18 +89,7 @@ The launcher (`Installer/launcher.py`) checks for updates from `UPDATE_URL`, but
 
 `Backend/main.py`:
 - WebSocket endpoint for agents.
-- REST endpoints for stats, exports, LiveKit tokens, and debug status.
-
-### 3.3 LiveKit
-
-`LiveKit/config.yaml` (runtime config):
-- `port: 81` — HTTP/WebSocket signaling.
-- `rtc.udp_port: 3478` — UDP media port.
-- API keys for LiveKit.
-
-Agents connect to `ws://<server-ip>:81` (set in `Installer/config.py`). The LiveKit worker connects to `ws://localhost:81` from the Backend machine.
-
-`LiveKit/config.example.yaml` (template) is a generic sample; the real ports/keys live in `config.yaml`.
+- REST endpoints for stats, exports, and debug status.
 
 ---
 
@@ -105,11 +99,6 @@ Agents connect to `ws://<server-ip>:81` (set in `Installer/config.py`). The Live
   - From `Backend/`:  
     `python -m uvicorn main:app --host 0.0.0.0 --port 80`
   - Or run the built control‑panel executable/script if you have it.
-
-- **LiveKit (optional)**
-  - From repo root:  
-    `start_livekit.bat`  
-    This changes into `LiveKit\` and runs `livekit-server` with `config.yaml`.
 
 - **Client**
   - From `Installer/`:  

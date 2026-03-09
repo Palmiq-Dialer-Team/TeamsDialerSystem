@@ -263,15 +263,12 @@ class DispositionSaver:
         return None
     
     def _bring_excel_to_foreground(self, workbook):
-        """Restore and bring the Excel window to the top so coloring/bolding apply when not minimized."""
-        try:
-            app = workbook.Application
-            app.Visible = True
-            app.WindowState = XL_NORMAL  # restore if minimized
-            hwnd = int(app.Hwnd)
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception as e:
-            print(f"Could not bring Excel to front: {e}")
+        """Legacy helper: previously forced Excel UI to the foreground.
+
+        Disabled to avoid spawning or stealing focus with extra Excel windows;
+        coloring and stamping work without changing window visibility.
+        """
+        return
 
     def _update_source_file(self, contact_data: Dict[str, Any], disposition: str):
         """Color row and stamp _DISPO_STAMP. Call from COM-initialized thread."""
@@ -279,8 +276,6 @@ class DispositionSaver:
         if not workbook:
             print("Warning: Could not access active workbook for live editing.")
             return
-
-        self._bring_excel_to_foreground(workbook)
         
         try:
             target_sheet_name = str(contact_data.get('sheetName')).strip()

@@ -8,46 +8,99 @@ Names in backticks like `toggle_autocall` (method) are **functions or methods**.
 
 ## 1. Where the main pieces live
 
-- **UI & main logic**: `Installer/main.py` (file/module)
-  - Class `TeamsPowerDialerApp` (QMainWindow subclass) – the main window and call controller
+- **UI shell & orchestration**: `Installer/main.py`
+  - Class `TeamsPowerDialerApp` (QMainWindow subclass) – the main window and **UI shell**.
+  - It now delegates call lifecycle to a dedicated workflow/core:
+    - `workflow_manager: CallWorkflowManager` – owns the current `CallSession`.
+    - `session` property – exposes the `CallSession` object for read/write.
   - Important methods:
-    - `toggle_autocall` (method) – turns autocall on/off
-    - `start_call` (method) – starts a single call to the current phone number
-    - `on_call_started` / `on_call_ended` (methods) – handle life-cycle of a call
-    - `handle_no_answer_timeout` (method) – handles long ringing with no answer
-    - `handle_disposition` (method, not shown here, but lives in `main.py`) – applies the user-selected disposition
-    - `reset_autocall_state`, `_stop_autocall_listening` (methods) – manage paused/autocall states
-    - `stop_audio_threads` (method) – stops audio capture + streaming threads after each call
+    - `toggle_autocall` – turns autocall on/off (updates `session.autocall_active` through `CallWorkflowManager`).
+    - `start_call` – starts a single call to the current phone number and calls `workflow_manager.begin_call(...)`.
+    - `on_call_started` / `on_call_ended` – respond to Teams signals and drive state transitions.
+    - `handle_no_answer_timeout` – handles long ringing with no answer.
+    - `handle_disposition` – applies the user-selected disposition (including Wrong Number / Invalid Contact logic).
+    - `reset_autocall_state`, `_stop_autocall_listening`, `stop_audio_threads` – manage timers, workers, and safe shutdown.
 
-- **Teams automation**: `Installer/modules/teams_auto.py` (module/file)
-  - Class `TeamsController` (QObject subclass) – **clicks the Teams call button**, finds the call window, and watches it.
+- **Call session model & workflow core**:
+  - `Installer/modules/call_state.py`
+    - Enum `CallSessionState` – formal states such as:
+      - `IDLE`, `READY`, `DIALING`, `CALLING`, `CONNECTED`, `AMD_MONITORING`,
+      - `HUMAN_CONFIRMED`, `DISPOSITION_PENDING`, `AUTO_ADVANCING`, `HANGING_UP`, `ENDED`, `ERROR`.
+  - `Installer/modules/call_session.py`
+    - Dataclass `CallSession` – authoritative per-call/session state:
+      - `state`, `state_reason`, `status_text`
+      - `call_id`, `call_record_created`
+      - `contact`, `phone_index`
+      - `autocall_active`, `waiting_for_disposition`, `autocall_resume_after_disposition`
+      - `using_local_ai`, `timer_extended`, `no_answer_handling`, `bot_initiated_hangup`, `confirmed_human`
+      - `has_no_response_history`, `current_ui_state`, and AMD/metadata fields.
+  - `Installer/modules/call_workflow_manager.py`
+    - Class `CallWorkflowManager` – **single source of truth** for call/session transitions:
+      - `begin_call(contact, phone_index)` – resets per-call state and moves to `DIALING`.
+      - `mark_call_started()` – moves to `CALLING`.
+      - `mark_call_connected(ai_monitoring: bool)` – moves to `CONNECTED` or `AMD_MONITORING`.
+      - `mark_human_confirmed()` – marks `confirmed_human` and moves to `HUMAN_CONFIRMED`.
+      - `mark_waiting_for_disposition(should_resume_autocall)` – sets `DISPOSITION_PENDING` and remembers whether to resume autocall.
+      - `mark_hanging_up(disposition)` – marks bot‑initiated hangup and moves to `HANGING_UP`.
+      - `mark_ended()`, `mark_ready()`, `mark_error(reason)` – terminal and error transitions.
+      - `set_autocall_active(is_active)` – updates `session.autocall_active` and moves to `AUTO_ADVANCING` when enabled from idle.
+      - `clear_waiting_for_disposition()` – clears disposition pause and returns to `READY` when appropriate.
+      - `sync_from_backend_message(message)` – captures backend `call_logged` acks and stores the stable `call_id`.
+
+- **Teams automation**: `Installer/modules/teams_auto.py`
+  - Class `TeamsController` (QObject subclass) – dials in Teams and monitors the call window.
   - Emits signals:
-    - `call_started_signal` (Qt signal)
-    - `call_connected_signal` (Qt signal)
-    - `call_ended_signal` (Qt signal)
-    - `call_failed_signal` (Qt signal; Teams “we couldn’t connect you” or recording failure)
+    - `call_started_signal`
+    - `call_connected_signal`
+    - `call_ended_signal`
+    - `call_failed_signal`
 
 - **Audio capture and streaming**:
-  - `Installer/modules/audio_core.py` (module/file) – class `AudioCapture` (audio capture class)
-    - Captures **mic + loopback** audio at 48 kHz.
-    - Mixes into a mono stream and pushes chunks into a queue.
-  - `Installer/modules/streamer.py` (module/file) – class `AudioStreamer` (WebSocket streamer class)
-    - Maintains a WebSocket connection to the Backend.
-    - Sends audio bytes from a queue + JSON metadata (e.g. “Call Started”, “Call Ended”, dispositions).
+  - `Installer/modules/audio_core.py` – class `AudioCapture`
+    - Captures **mic + loopback** audio at 48 kHz, mixes into mono and pushes into a queue.
+  - `Installer/modules/streamer.py` – class `AudioStreamer`
+    - Maintains a WebSocket connection to the backend.
+    - Sends audio bytes from a queue + JSON metadata (e.g. “call_started”, “log_disposition”, “update_disposition”).
+    - Runs its own asyncio event loop in a background thread and pushes inbound messages into a queue **and** an optional dispatcher.
   - In `main.py`:
-    - `AudioWorker` (QThread subclass) – calls `AudioCapture` and pushes audio chunks into `audio_queue`.
-    - `StreamerWorker` (QThread subclass) – pulls from `audio_queue` and calls `AudioStreamer.stream_audio(...)`.
+    - `AudioWorker` (QThread) – calls `AudioCapture` and pushes audio chunks into `audio_queue` and AMD’s input queue.
+    - `StreamerWorker` (QThread) – schedules `AudioStreamer.stream_audio(audio_queue)` on the streamer event loop.
 
-- **Client-side AI (AMD)**: `Installer/modules/ai_core.py` (module/file)
+- **Thread-safe inbound messaging**:
+  - `Installer/modules/message_dispatcher.py`
+    - Class `QtMessageDispatcher` (QObject) – **bridges websocket messages into Qt signals**:
+      - Signals for specific types: `force_hangup_received`, `ai_unavailable_received`, `announcement_received`,
+        `maintenance_warning_received`, `maintenance_shutdown_received`, `callback_*`, `audio_ack_received`, `call_logged`, etc.
+      - `dispatch(message: dict)` is called from the `AudioStreamer` thread; it emits on the Qt main thread.
+  - In `main.py`:
+    - `TeamsPowerDialerApp` constructs one `QtMessageDispatcher` and passes it to `AudioStreamer`.
+    - `setup_connections` connects dispatcher signals to UI slots such as `handle_force_hangup`, `handle_announcement`,
+      `handle_maintenance_*`, `handle_callback_prompt`, and `_on_call_logged_message` (which stores `session.call_id`).
+
+- **Client-side AI (AMD)**: `Installer/modules/ai_core.py`
   - AMD = Answering Machine Detection.
-  - Class `AMDDetector` (class) + `AMDState` (class in `main.py`) + `AMDWorker` (QThread subclass)
-  - Decides **voicemail / bot / invalid number / human**, tells the main window whether to **auto-hangup** or **keep call**.
-  - Documented in detail in `Installer/modules/CLIENT_SIDE_AI.md` (documentation file).
+  - `AMDDetector` + `AMDState` + `AMDWorker` (QThread in `main.py`):
+    - Decide **voicemail / bot / invalid number / human** and drive:
+      - `_pending_force_hangup_disposition` (“No Response”, “Voicemail”, “Wrong Number” inferred from invalid-number phrases).
+      - `handle_local_hangup` (local AI‑initiated hangup while autocall is active).
+      - `handle_human_detected` (marks session as human‑confirmed and pauses autocall).
+  - The Whisper model is still preloaded once; Silero VAD is now preloaded and **reused per call** via deep copies.
 
-- **Filters, session, dispositions**:
-  - `Installer/modules/filter_manager.py` (module/file) – time-of-day / state / industry filtering; affects which contacts get called next.
-  - `Installer/modules/session_manager.py` (module/file) – remembers last workbook, row, etc.
-  - `Installer/modules/disposition_manager.py` (module/file) – `DispositionSaver` (class); writes results back to Excel and per-disposition files.
+- **Filters, session, dispositions, Excel**:
+  - `Installer/modules/filter_manager.py` – time-of-day / state / industry filtering; determines which contacts are eligible for dialing.
+  - `Installer/modules/session_manager.py` – remembers last workbook path, row, and sort state.
+  - `Installer/modules/disposition_manager.py` – `DispositionSaver`:
+    - Uses **COM-inspected workbook path** (`workbook_path`) plus safe re‑attachment per thread.
+    - Updates the source workbook row (color, `_DISPO_STAMP`, `Notes`) on a background thread.
+    - Writes per-disposition `.xlsx` files (Booked Meeting, No Response, Invalid Contact, etc.).
+    - Provides helpers for Wrong Number flows (delete phone from source) and undo (revert source + disposition file).
+  - `Installer/modules/active_data_reader.py` – `ActiveExcelReader`:
+    - Attaches to the active Excel instance and builds a pandas DataFrame of contacts.
+  - `Installer/modules/excel_import_worker.py`
+    - `ExcelImportWorker` (QObject living in a `QThread`):
+      - Initializes COM **in the worker thread**.
+      - Creates a private `ActiveExcelReader`, reads the active workbook, and returns only plain data (`contacts`, `sheet_name`, `row_count`) via a Qt signal.
+    - `TeamsPowerDialerApp` receives this data in `_on_import_worker_finished`, then constructs `DispositionSaver` on the UI thread using the workbook path obtained via `ActiveExcelReader.get_active_file_path()` (no COM crossing between threads).
 
 ---
 
@@ -146,6 +199,48 @@ Inside `start_call` (simplified):
   - Returns `True` if it believes the call was successfully initiated.
 
 If initiating the call fails, the dialing worker finishes with `success=False`, and `start_call` can show an error or fail gracefully. In the normal case, Teams opens a new call window shortly after that.
+
+---
+
+## 3.1 Call Session State Diagram (CallWorkflowManager)
+
+At a higher level, the call lifecycle is tracked by `CallSessionState` in `call_state.py`, owned by `CallWorkflowManager` in `call_workflow_manager.py`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> READY
+    READY --> DIALING: start_call()
+    DIALING --> CALLING: on_call_started()
+    CALLING --> CONNECTED: on_call_connected()\n(no AI / manual)
+    CALLING --> AMD_MONITORING: on_call_connected()\n(autocall + AMD)
+
+    AMD_MONITORING --> HUMAN_CONFIRMED: handle_human_detected()
+    AMD_MONITORING --> HANGING_UP: handle_local_hangup()\n(force_hangup/invalid/voicemail)
+
+    CONNECTED --> DISPOSITION_PENDING: call ended + human confirmed\n(waiting_for_disposition)
+    HUMAN_CONFIRMED --> DISPOSITION_PENDING: call ended
+
+    DISPOSITION_PENDING --> READY: handle_disposition()\n(no autocall resume)
+    DISPOSITION_PENDING --> AUTO_ADVANCING: handle_disposition()\n(resume autocall)
+
+    AUTO_ADVANCING --> DIALING: _no_answer_automation_timer\n(or auto_call_on_disposition)
+
+    CALLING --> HANGING_UP: handle_call_failure()\n(Teams error)
+    AMD_MONITORING --> HANGING_UP: handle_force_hangup()\n(bot/voicemail)
+    CONNECTED --> HANGING_UP: local hangup\n(no autocall)
+
+    HANGING_UP --> ENDED: on_call_ended()
+    ENDED --> READY: reset_ui_state()
+```
+
+This diagram is a **logical view**; the actual transitions are driven by:
+
+- Teams signals (`call_started_signal`, `call_connected_signal`, `call_ended_signal`, `call_failed_signal`).
+- AMD events (`human_detected`, `force_hangup`, ambiguous “continue”).
+- Autocall timers (`no_answer_timer`, `_no_answer_automation_timer`).
+- Manual actions (`toggle_autocall`, `handle_disposition`).
+
+`TeamsPowerDialerApp` updates the `CallSession` via `CallWorkflowManager` (e.g. `begin_call`, `mark_call_started`, `mark_call_connected`, `mark_waiting_for_disposition`, `mark_hanging_up`, `mark_ended`), and the UI properties like `call_status` are projections of this state.
 
 ---
 

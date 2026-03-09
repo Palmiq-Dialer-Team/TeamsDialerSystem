@@ -8,26 +8,31 @@ Code location: `Installer/modules/ai_core.py`
 
 ## 1. What the client-side AI does
 
-When Start Auto-Call is on, the Installer:
+When **Autocall is ON** and a call is **Connected**, the Installer:
 
-1. Captures loopback (system) audio only (what the remote party says).
-2. Uses Silero VAD to detect when someone is speaking.
-3. Buffers a few seconds of that speech (see `BUFFER_SECONDS`), then sends it to faster-whisper for transcription.
-4. Runs phrase matching on the transcript to decide:
-   - Hang up (voicemail, bot/screening, invalid number), or
-   - Keep call (human detected), or
-   - Keep listening (ambiguous; may transcribe again later).
+1. Captures loopback (system) audio only (what the remote party says) alongside mic audio.
+2. Feeds loopback audio into an `AMDWorker` thread, which wraps:
+   - `AMDDetector` from `ai_core.py` (shared Whisper model + VAD factory).
+   - `AMDState` in `main.py` (per-call state machine).
+3. Uses Silero VAD (16 kHz mono) to detect speech, buffer a few seconds of speech (`BUFFER_SECONDS`), and decide **when** to transcribe.
+4. Calls faster-whisper once enough speech has been buffered, then runs phrase matching on the transcript to decide:
+   - **Hang up** – voicemail, bot/screening, invalid number (local AI sets a pending disposition and triggers a hangup).
+   - **Keep call** – human detected.
+   - **Keep listening** – ambiguous; may transcribe again later, with a fail-safe that eventually treats it as human.
 
-No audio is sent to the server for AMD in this mode; everything runs locally.
+All AMD logic (VAD + Whisper + intent detection) runs **entirely on the client**:
+
+- The Backend does **not** run VAD/Whisper and does **not** send any AMD `force_hangup` messages.
+- The server only receives mixed audio for monitoring and the final disposition metadata once the call outcome is known.
 
 ---
 
-## 2. Libraries used
+## 2. Libraries and model lifecycle
 
 | Library | Role |
 |--------|------|
-| Silero VAD (`torch.hub.load("snakers4/silero-vad", "silero_vad")`) | Voice activity detection: “is there speech in this chunk?”. Runs on 16 kHz mono. Stateful (LSTM); each call gets a new VAD model instance. |
-| faster-whisper | Transcribes buffered audio to text. Model: `tiny.en` (English), CPU, float32. First run downloads the model from Hugging Face (ensure `pip-system-certs` is in requirements for HTTPS). |
+| Silero VAD (`torch.hub.load("snakers4/silero-vad", "silero_vad")`) | Voice activity detection: “is there speech in this chunk?”. Runs on 16 kHz mono. **Preloaded once** per process via `AMDDetector._ensure_vad()`. Each call gets a **deep-copied** model instance with its own state. |
+| faster-whisper | Transcribes buffered audio to text. Model: `tiny.en` (English), CPU, float32. First run downloads the model from Hugging Face (ensure `pip-system-certs` is in requirements for HTTPS). Held as a **single shared Whisper model** inside `AMDDetector`. |
 | torch / torchaudio | PyTorch for VAD and resampling. `torchaudio.transforms.Resample(48000, 16000)` resamples loopback 48 kHz → 16 kHz for VAD and Whisper. |
 | numpy | Audio buffers and array handling. |
 
@@ -37,19 +42,37 @@ Relevant constants in `ai_core.py`: `INPUT_RATE = 48000`, `VAD_RATE = 16000`, `B
 
 ## 3. High-level flow
 
-1. Call connects → `AMDState` is created with a fresh Silero VAD model for that call.
-2. First ~3 seconds → grace period: VAD is ignored (avoids ring/beep false triggers).
-3. VAD runs on 16 kHz loopback chunks (~32 ms). When speech probability stays above threshold for several chunks, state switches to `speech_buffering`.
-4. Buffering → loopback audio is appended. Either:
-   - Early transcription: after clear speech, if silence > ~1.2 s and buffer has ≥ ~2 s of audio, the buffer is sent to Whisper immediately.
-   - Full buffer: once the buffer duration elapses, the buffer is sent to Whisper.
-5. Transcription → Whisper returns a single text string for that buffer.
-6. Analysis → `analyze_buffered_audio()`:
-   - Calls `detect_call_intent(text)` → checks phrase lists in a fixed order (see below).
-   - If intent is `voicemail`, `bot_screening`, or `invalid_number` → return `force_hangup` (auto-dial skips / hangs up).
-   - Else if `is_human_greeting(text)` and buffer is short (< 2 s) → `human_detected` (keep call).
-   - Else if transcript is empty or ambiguous → `continue` (listening); after several such “ambiguous” buffers, treat as human (fail-safe).
-   - On any exception → `human_detected` (fail-safe).
+1. Call connects (`TeamsController.call_connected_signal`) → `TeamsPowerDialerApp.on_call_connected`:
+   - Starts `AudioWorker` and `StreamerWorker`.
+   - Creates (or reuses) a global `AMDDetector`.
+   - Creates an `AMDWorker` QThread for this call, passing it:
+     - The shared `AMDDetector`.
+     - A fresh `AMDState` object that tracks per-call VAD/transcript state.
+   - Hooks AMD signals:
+     - `human_detected_signal` → `handle_human_detected`
+     - `force_hangup_signal(reason)` → `handle_local_hangup(reason)`
+     - `continue_result_signal` → `_on_amd_continue_extend_timer`
+     - `transcription_update_signal` → `_append_transcription_display`
+2. First ~3 seconds → grace period: AMDState ignores VAD so ringback tones / early noise don’t trigger early decisions.
+3. VAD runs on 16 kHz loopback chunks (~32 ms). When speech probability stays above threshold for several chunks, AMDState moves into `speech_buffering` and starts filling a buffer of up to `BUFFER_SECONDS` (~5 s).
+4. Buffering:
+   - Early transcription: if there is a clear speech event and subsequent silence > ~1.2 s and the buffer has ≥ ~2 s of audio, the buffer is sent to Whisper early.
+   - Full buffer: when `BUFFER_SECONDS` is reached, the accumulated buffer is sent to Whisper.
+5. Transcription → `AMDDetector.transcribe(...)`:
+   - Uses the **shared** Whisper model (lazy-loaded on first use).
+   - Returns a text string or empty string on failure.
+6. Analysis → `analyze_buffered_audio()` in `ai_core.py`:
+   - Calls `detect_call_intent(text)` (see phrase lists below) to classify:
+     - `invalid_number`
+     - `bot_screening`
+     - `voicemail`
+     - or `none`.
+   - If intent is `invalid_number` / `bot_screening` / `voicemail` → returns `("force_hangup", reason)`.
+   - Else if `is_human_greeting(text)` and buffer duration \< `HUMAN_GREETING_MAX_SEC` (~2 s) → `("human_detected", reason)`.
+   - Else if transcript is empty or ambiguous:
+     - AMDState counts “ambiguous events”.
+     - After several ambiguous cycles (configurable via `ambiguous_event_count`), it fails safe as **human**.
+   - On any exception, it returns **human_detected** (fail-safe).
 
 ---
 

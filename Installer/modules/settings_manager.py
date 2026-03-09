@@ -100,12 +100,16 @@ class SettingsManager:
         return self.settings.get("audio", {})
 
     def set_audio_settings(self, mic_idx, loop_idx, volume=None, remember=None):
-        if remember is not None:
-            self.settings["audio"]["remember_audio_devices"] = remember
-        if remember is False:
-            self.settings["audio"]["mic_index"] = None
-            self.settings["audio"]["loopback_index"] = None
-        else:
+        """
+        Persist audio settings.
+
+        Device indices are only overwritten when remember=True on this save.
+        This makes the checkbox a one-time action: users can save other settings
+        later without replacing the previously remembered devices unless they
+        explicitly check the box again.
+        """
+        if remember is True:
+            self.settings["audio"]["remember_audio_devices"] = True
             self.settings["audio"]["mic_index"] = mic_idx
             self.settings["audio"]["loopback_index"] = loop_idx
         if volume is not None:

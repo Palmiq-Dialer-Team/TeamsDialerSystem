@@ -7,6 +7,7 @@ This module is the single source of truth for AMD logic:
 - The Backend does not run VAD/Whisper and never sends force_hangup.
 """
 
+import copy
 import re
 import string
 import time
@@ -176,25 +177,53 @@ class AMDDetector:
     def __init__(self):
         self._whisper_model = None
         self._whisper_load_error: Optional[str] = None
+        self._shared_vad_model = None
+        self._vad_load_error: Optional[str] = None
         self.resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000)
         self.last_transcript: str = ""
         self.ambiguous_event_count: int = 0  # persistence: ambiguous/empty buffers before declaring human
+        self._ensure_vad()
 
-    def get_new_vad_model(self):
-        """
-        Load a FRESH Silero VAD instance for each call.
-        Silero VAD is stateful (LSTM); sharing one instance across calls can corrupt
-        internal state and cause prob=0. Each call gets its own model.
-        """
+    def _ensure_vad(self) -> bool:
+        if self._shared_vad_model is not None:
+            return True
+        if self._vad_load_error is not None:
+            print(f"[AI] Silero VAD previously failed to load: {self._vad_load_error}")
+            return False
         try:
             model, _ = torch.hub.load(
                 repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True
             )
             model.reset_states()
-            return model
+            self._shared_vad_model = model
+            return True
         except Exception as e:
             print(f"[AI] Failed to load VAD model: {e}")
+            self._vad_load_error = str(e)
+            return False
+
+    def get_new_vad_model(self):
+        """
+        Reuse the preloaded Silero VAD base model and deep-copy per-call state.
+        Falls back to a fresh load if deepcopy is not supported by this model build.
+        """
+        if not self._ensure_vad():
             return None
+        try:
+            model = copy.deepcopy(self._shared_vad_model)
+            model.reset_states()
+            return model
+        except Exception as e:
+            print(f"[AI] VAD deepcopy failed, falling back to direct load: {e}")
+            try:
+                model, _ = torch.hub.load(
+                    repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True
+                )
+                model.reset_states()
+                return model
+            except Exception as load_error:
+                print(f"[AI] Failed to load fallback VAD model: {load_error}")
+                return None
 
     def _ensure_whisper(self) -> bool:
         if self._whisper_model is not None:

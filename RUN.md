@@ -23,8 +23,30 @@ Short setup and run guide. For architecture and config details see **PROJECT_OVE
    - **Server-only change:** Restart the server from the Control Panel (or Stop then Start).  
    - **Control Panel change:** Rebuild the Control Panel (e.g. PyInstaller from `Backend/`). Rebuild only when you need to ship an updated exe.
 
-5. **LiveKit (optional)**  
-   From repo root run **`start_livekit.bat`** to start the LiveKit server (needs `LiveKit/config.yaml`).
+---
+
+## Remote console (optional, for admins)
+
+The Backend exposes a simple **remote console** UI that lets an authorized admin view logs and request shutdown/restart or trigger a client release from a browser.
+
+1. **Enable it (server config)**  
+   Set these environment variables on the server machine before starting the Backend:
+   - `REMOTE_CONSOLE_ENABLED=1`
+   - `REMOTE_CONSOLE_PASSWORD_HASH=<sha256 of your chosen password>`  
+     (Generate with a short one-liner, e.g. `python -c "import hashlib; print(hashlib.sha256(b'my-password').hexdigest())"`)
+   - Optional but recommended: `REMOTE_CONSOLE_LOG_PATH` – path to the log file the console should tail (default is `Backend/server.log` if not set).
+
+2. **Open the remote console**  
+   - Navigate to `http://<server-host>/remote-console/login` in a browser.
+   - Solve the simple math captcha and enter the password that matches `REMOTE_CONSOLE_PASSWORD_HASH`.
+
+3. **What you can do there**  
+   - View the tail of the server log (`/remote-console/logs` via the panel).
+   - Request a **graceful shutdown** of the server (`/remote-console/shutdown` – session + CSRF protected).
+   - Request a **logical restart** (writes a marker to the log that the Control Panel can react to).
+   - Trigger `release_client.py` via **“Push client update”** so the server rebuilds/publishes a new client ZIP (output appended to the log).
+
+> For full details and security notes, see `PROJECT_OVERVIEW.md` (Backend section) and `Backend/main.py` (remote console endpoints).
 
 ---
 
@@ -49,6 +71,5 @@ Short setup and run guide. For architecture and config details see **PROJECT_OVE
 |------|-------------|
 | Backend setup (venv + deps) | `Backend/setup.bat` |
 | Start server + open Control Panel | `Backend/start_control_panel.bat` |
-| Start LiveKit | Repo root: `start_livekit.bat` |
 | Client app usage | `Installer/modules/CLIENT_MODULES.md` |
 | Control Panel / Backend | `PROJECT_OVERVIEW.md` |

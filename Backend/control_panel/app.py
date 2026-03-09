@@ -12,7 +12,7 @@ import urllib.error
 from pathlib import Path
 
 from .server_controller import ServerController
-from .config import DASHBOARD_URL, DASHBOARD_URL_NETWORK, BACKEND_DIR, SERVER_PORT
+from .config import DASHBOARD_URL, DASHBOARD_URL_NETWORK, BACKEND_DIR, SERVER_PORT, build_auth_headers
 from . import db_viewer
 
 ANNOUNCEMENT_IMAGES_DIR = Path(BACKEND_DIR) / "announcement_images"
@@ -44,7 +44,10 @@ def matches_filter(line: str, pattern) -> bool:
 def _fetch_debug_status(base_url: str) -> dict | None:
     """Fetch /api/debug/status from server. Returns None on failure."""
     try:
-        req = urllib.request.Request(f"{base_url.rstrip('/')}/api/debug/status")
+        req = urllib.request.Request(
+            f"{base_url.rstrip('/')}/api/debug/status",
+            headers=build_auth_headers(),
+        )
         with urllib.request.urlopen(req, timeout=3) as resp:
             return json.loads(resp.read().decode())
     except Exception:
@@ -58,6 +61,7 @@ def _post_debug_action(base_url: str, path: str) -> dict | None:
             f"{base_url.rstrip('/')}{path}",
             data=b"",
             method="POST",
+            headers=build_auth_headers(),
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read().decode())
@@ -314,7 +318,7 @@ class AnnouncementDialog:
         url = f"{base}/api/control/announcement"
         body = json.dumps({"message": message, "image": self.selected_image}).encode("utf-8")
         try:
-            req = urllib.request.Request(url, data=body, method="POST")
+            req = urllib.request.Request(url, data=body, method="POST", headers=build_auth_headers())
             req.add_header("Content-Type", "application/json")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())

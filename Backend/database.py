@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 import os
 from pathlib import Path
+from uuid import uuid4
+
+from db_connection import get_connection, get_readonly_connection
 
 # Database file path (TEAMS_DIALER_DB can override)
 CENTRAL_SERVER_DIR = Path(__file__).parent
@@ -25,89 +28,89 @@ def init_db():
     """
     # Log which database file is in use
     print(f"[DB] Using database: {DB_PATH.resolve()}")
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    cursor = conn.cursor()
+    with get_connection(DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        cursor = conn.cursor()
     
-    # Check if calls table exists and has old schema
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='calls'")
-    table_exists = cursor.fetchone()
-    
-    if table_exists:
-        # Check if table has old schema (agent column) or new schema (agent_id column)
-        cursor.execute("PRAGMA table_info(calls)")
-        columns = [row[1] for row in cursor.fetchall()]
+        # Check if calls table exists and has old schema
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='calls'")
+        table_exists = cursor.fetchone()
         
-        if 'agent' in columns and 'agent_id' not in columns:
-            print("Detected old database schema. Migrating to new schema...")
-            cursor.execute("DROP TABLE IF EXISTS calls")
-            conn.commit()
-        elif 'agent_id' not in columns:
-            print("Detected incomplete schema. Recreating calls table...")
-            cursor.execute("DROP TABLE IF EXISTS calls")
-            conn.commit()
+        if table_exists:
+            # Check if table has old schema (agent column) or new schema (agent_id column)
+            cursor.execute("PRAGMA table_info(calls)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'agent' in columns and 'agent_id' not in columns:
+                print("Detected old database schema. Migrating to new schema...")
+                cursor.execute("DROP TABLE IF EXISTS calls")
+            elif 'agent_id' not in columns:
+                print("Detected incomplete schema. Recreating calls table...")
+                cursor.execute("DROP TABLE IF EXISTS calls")
     
-    # Enhanced calls table to store contact details, notes, and full contact_data JSON
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agent_id TEXT NOT NULL,
-            phone TEXT,
-            contact_name TEXT,
-            disposition TEXT,
-            duration INTEGER,
-            notes TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            campaign_mode TEXT,
-            contact_data TEXT
-        )
-    """)
+        # Enhanced calls table to store contact details, notes, and full contact_data JSON
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id TEXT UNIQUE,
+                agent_id TEXT NOT NULL,
+                phone TEXT,
+                contact_name TEXT,
+                disposition TEXT,
+                duration INTEGER,
+                notes TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                campaign_mode TEXT,
+                contact_data TEXT
+            )
+        """)
 
-    # Ensure contact_data column exists on existing databases (backwards-compatible migration)
-    cursor.execute("PRAGMA table_info(calls)")
-    call_columns = [row[1] for row in cursor.fetchall()]
-    if "contact_data" not in call_columns:
-        cursor.execute("ALTER TABLE calls ADD COLUMN contact_data TEXT")
+        # Ensure contact_data and call_id columns exist on existing databases
+        cursor.execute("PRAGMA table_info(calls)")
+        call_columns = [row[1] for row in cursor.fetchall()]
+        if "contact_data" not in call_columns:
+            cursor.execute("ALTER TABLE calls ADD COLUMN contact_data TEXT")
+        if "call_id" not in call_columns:
+            cursor.execute("ALTER TABLE calls ADD COLUMN call_id TEXT")
 
-    # Fix rows with NULL id (can happen if another process inserted with id=NULL or sequence glitch).
-    _fix_null_call_ids_impl(conn)
+        # Fix rows with NULL id or missing call_id.
+        _fix_null_call_ids_impl(conn)
+        _ensure_call_ids_impl(conn)
 
-    # Create callbacks table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS callbacks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agent_id TEXT NOT NULL,
-            scheduled_time TEXT NOT NULL,
-            notes TEXT,
-            status TEXT DEFAULT 'PENDING',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            source_workbook_path TEXT,
-            source_sheet_name TEXT,
-            source_row_index INTEGER,
-            contact_data TEXT
-        )
-    """)
-    
-    # Drop old indexes if they exist (they might reference wrong columns)
-    cursor.execute("DROP INDEX IF EXISTS idx_agent_timestamp")
-    
-    # Ensure indexes for performance on calls table
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_time ON calls(agent_id, timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_disposition ON calls(disposition)")
-    
-    # Create indexes on callbacks for faster queries
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_callback_agent_status 
-        ON callbacks(agent_id, status)
-    """)
-    
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_callback_scheduled_time 
-        ON callbacks(scheduled_time, status)
-    """)
-    
-    conn.commit()
-    conn.close()
+        # Create callbacks table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS callbacks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                scheduled_time TEXT NOT NULL,
+                notes TEXT,
+                status TEXT DEFAULT 'PENDING',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                source_workbook_path TEXT,
+                source_sheet_name TEXT,
+                source_row_index INTEGER,
+                contact_data TEXT
+            )
+        """)
+        
+        # Drop old indexes if they exist (they might reference wrong columns)
+        cursor.execute("DROP INDEX IF EXISTS idx_agent_timestamp")
+        
+        # Ensure indexes for performance on calls table
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_calls_call_id ON calls(call_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_time ON calls(agent_id, timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_disposition ON calls(disposition)")
+        
+        # Create indexes on callbacks for faster queries
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_callback_agent_status 
+            ON callbacks(agent_id, status)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_callback_scheduled_time 
+            ON callbacks(scheduled_time, status)
+        """)
 
 
 def _fix_null_call_ids_impl(conn: sqlite3.Connection) -> int:
@@ -134,16 +137,26 @@ def _fix_null_call_ids_impl(conn: sqlite3.Connection) -> int:
     return len(null_id_rowids)
 
 
+def _ensure_call_ids_impl(conn: sqlite3.Connection) -> int:
+    """Backfill missing UUID call identifiers on existing rows."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM calls WHERE call_id IS NULL OR TRIM(call_id) = '' ORDER BY id")
+    missing_rows = [row[0] for row in cursor.fetchall()]
+    if not missing_rows:
+        return 0
+    for row_id in missing_rows:
+        cursor.execute("UPDATE calls SET call_id = ? WHERE id = ?", (str(uuid4()), row_id))
+    print(f"[DB] Backfilled {len(missing_rows)} call_id value(s)")
+    return len(missing_rows)
+
+
 def fix_null_call_ids() -> int:
     """
     Open DB, fix any call rows with NULL id, close. Used at startup and after disposition writes
     so the DB can heal without restart. Returns number of rows fixed.
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    try:
+    with get_connection(DB_PATH) as conn:
         return _fix_null_call_ids_impl(conn)
-    finally:
-        conn.close()
 
 
 def log_call(data_dict: Dict[str, Any]):
@@ -151,43 +164,40 @@ def log_call(data_dict: Dict[str, Any]):
     Backwards-compatible simple call logger used by existing callback flows.
     Kept for legacy use; new code should prefer log_disposition with richer data.
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    # Use provided values or defaults for backwards compatibility
-    contact_name = data_dict.get("contact_name", "")
-    notes = data_dict.get("notes", "")
-    campaign_mode = data_dict.get("campaign_mode", "General")
-    timestamp = data_dict.get("timestamp") or datetime.now().isoformat()
-    contact_data = data_dict.get("contact_data")
-    # Normalize contact_data to a JSON string if a dict is passed
-    if isinstance(contact_data, dict):
-        import json
-        contact_data = json.dumps(contact_data)
-    
-    cursor.execute(
-        """
-        INSERT INTO calls (agent_id, phone, disposition, duration, timestamp, contact_name, notes, campaign_mode, contact_data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data_dict.get("agent"),
-            data_dict.get("phone"),
-            data_dict.get("disposition"),
-            int(data_dict.get("duration") or 0),
-            timestamp,
-            contact_name,
-            notes,
-            campaign_mode,
-            contact_data,
-        ),
-    )
-    
-    conn.commit()
-    conn.close()
+    call_uuid = str(data_dict.get("call_id") or uuid4())
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        # Use provided values or defaults for backwards compatibility
+        contact_name = data_dict.get("contact_name", "")
+        notes = data_dict.get("notes", "")
+        campaign_mode = data_dict.get("campaign_mode", "General")
+        timestamp = data_dict.get("timestamp") or datetime.now().isoformat()
+        contact_data = data_dict.get("contact_data")
+        if isinstance(contact_data, dict):
+            contact_data = json.dumps(contact_data)
+        
+        cursor.execute(
+            """
+            INSERT INTO calls (call_id, agent_id, phone, disposition, duration, timestamp, contact_name, notes, campaign_mode, contact_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                call_uuid,
+                data_dict.get("agent"),
+                data_dict.get("phone"),
+                data_dict.get("disposition"),
+                int(data_dict.get("duration") or 0),
+                timestamp,
+                contact_name,
+                notes,
+                campaign_mode,
+                contact_data,
+            ),
+        )
+    return call_uuid
 
 
-def log_disposition(data: Dict[str, Any]):
+def log_disposition(data: Dict[str, Any]) -> str:
     """
     Saves a finalized call disposition to the central database.
     Expected keys:
@@ -199,15 +209,13 @@ def log_disposition(data: Dict[str, Any]):
         - notes
         - campaign_mode
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-
+    call_uuid = str(data.get("call_id") or uuid4())
     contact_data = data.get("contact_data")
     if isinstance(contact_data, dict):
-        import json
         contact_data = json.dumps(contact_data)
     
     insert_args = (
+        call_uuid,
         data.get("agent_id"),
         data.get("phone"),
         data.get("contact_name"),
@@ -218,40 +226,36 @@ def log_disposition(data: Dict[str, Any]):
         data.get("campaign_mode", "General"),
         contact_data,
     )
-    try:
-        # SQLite 3.35+: RETURNING id gives the inserted id atomically (avoids lastrowid race in async/threaded use)
-        cursor.execute(
-            """
-            INSERT INTO calls (agent_id, phone, contact_name, disposition, duration, notes, timestamp, campaign_mode, contact_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING id
-            """,
-            insert_args,
-        )
-        row = cursor.fetchone()
-        if row is not None:
-            pass  # id captured; no need to use lastrowid
-        else:
-            # RETURNING returned nothing (shouldn't happen); fall back to lastrowid
-            _id = cursor.lastrowid
-            if _id is None or _id == 0:
-                print(f"[DB] WARNING: log_disposition INSERT RETURNING gave no row, lastrowid={_id}")
-    except sqlite3.OperationalError:
-        # Old SQLite (< 3.35) doesn't support RETURNING; use plain INSERT + lastrowid
-        cursor.execute(
-            """
-            INSERT INTO calls (agent_id, phone, contact_name, disposition, duration, notes, timestamp, campaign_mode, contact_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            insert_args,
-        )
-        lastrowid = cursor.lastrowid
-        if lastrowid is None or lastrowid == 0:
-            print(f"[DB] WARNING: log_disposition INSERT did not get an id (lastrowid={lastrowid}) — possible NULL id row created")
-    conn.commit()
-    conn.close()
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO calls (call_id, agent_id, phone, contact_name, disposition, duration, notes, timestamp, campaign_mode, contact_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
+                """,
+                insert_args,
+            )
+            row = cursor.fetchone()
+            if row is None:
+                _id = cursor.lastrowid
+                if _id is None or _id == 0:
+                    print(f"[DB] WARNING: log_disposition INSERT RETURNING gave no row, lastrowid={_id}")
+        except sqlite3.OperationalError:
+            cursor.execute(
+                """
+                INSERT INTO calls (call_id, agent_id, phone, contact_name, disposition, duration, notes, timestamp, campaign_mode, contact_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                insert_args,
+            )
+            lastrowid = cursor.lastrowid
+            if lastrowid is None or lastrowid == 0:
+                print(f"[DB] WARNING: log_disposition INSERT did not get an id (lastrowid={lastrowid}) — possible NULL id row created")
     # Safety net: heal any NULL-id rows (e.g. from older code paths or glitches)
     fix_null_call_ids()
+    return call_uuid
 
 
 def update_call_disposition(data: Dict[str, Any]) -> bool:
@@ -260,107 +264,103 @@ def update_call_disposition(data: Dict[str, Any]) -> bool:
     Used when the user clicks a disposition button after a call has ended.
     Returns True if a row was updated, False if no matching call (will need INSERT elsewhere).
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
     agent_id = data.get("agent_id")
     phone = data.get("phone", "").strip()
-    if not agent_id or not phone:
-        conn.close()
+    explicit_call_id = str(data.get("call_id") or "").strip()
+    if not agent_id:
         return False
-    # Find most recent call for this agent+phone with "No Disposition" (last 4 hours)
-    cutoff = (datetime.now() - timedelta(hours=4)).isoformat()
-    cursor.execute(
-        """
-        SELECT id FROM calls
-        WHERE agent_id = ? AND phone = ? AND disposition = 'No Disposition' AND timestamp >= ?
-        ORDER BY timestamp DESC LIMIT 1
-        """,
-        (agent_id, phone, cutoff),
-    )
-    row = cursor.fetchone()
 
-    # Fallback: if no 'No Disposition' row exists (e.g. autocall/AI already set a disposition
-    # like "No Response"), update the most recent call for this agent+phone in the same window.
-    if not row:
-        cursor.execute(
-            """
-            SELECT id FROM calls
-            WHERE agent_id = ? AND phone = ? AND timestamp >= ?
-            ORDER BY timestamp DESC LIMIT 1
-            """,
-            (agent_id, phone, cutoff),
-        )
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
-            return False
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        call_row_id = None
+        if explicit_call_id:
+            cursor.execute("SELECT id FROM calls WHERE call_id = ?", (explicit_call_id,))
+            row = cursor.fetchone()
+            if row:
+                call_row_id = row[0]
+        if call_row_id is None:
+            if not phone:
+                return False
+            cutoff = (datetime.now() - timedelta(hours=4)).isoformat()
+            cursor.execute(
+                """
+                SELECT id FROM calls
+                WHERE agent_id = ? AND phone = ? AND disposition = 'No Disposition' AND timestamp >= ?
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                (agent_id, phone, cutoff),
+            )
+            row = cursor.fetchone()
+            if not row:
+                cursor.execute(
+                    """
+                    SELECT id FROM calls
+                    WHERE agent_id = ? AND phone = ? AND timestamp >= ?
+                    ORDER BY timestamp DESC LIMIT 1
+                    """,
+                    (agent_id, phone, cutoff),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return False
+            call_row_id = row[0]
 
-    call_id = row[0]
+        contact_data = data.get("contact_data")
+        if isinstance(contact_data, dict):
+            contact_data = json.dumps(contact_data)
 
-    # Optional contact_data update (when client provides it)
-    contact_data = data.get("contact_data")
-    if isinstance(contact_data, dict):
-        import json
-        contact_data = json.dumps(contact_data)
-
-    if contact_data is not None:
-        cursor.execute(
-            """
-            UPDATE calls SET disposition = ?, notes = ?, contact_data = ?
-            WHERE id = ?
-            """,
-            (data.get("disposition", ""), data.get("notes", ""), contact_data, call_id),
-        )
-    else:
-        cursor.execute(
-            """
-            UPDATE calls SET disposition = ?, notes = ?
-            WHERE id = ?
-            """,
-            (data.get("disposition", ""), data.get("notes", ""), call_id),
-        )
-    conn.commit()
-    conn.close()
-    return True
+        if contact_data is not None:
+            cursor.execute(
+                """
+                UPDATE calls SET disposition = ?, notes = ?, contact_data = ?
+                WHERE id = ?
+                """,
+                (data.get("disposition", ""), data.get("notes", ""), contact_data, call_row_id),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE calls SET disposition = ?, notes = ?
+                WHERE id = ?
+                """,
+                (data.get("disposition", ""), data.get("notes", ""), call_row_id),
+            )
+        return cursor.rowcount > 0
 
 
-def create_call_record(call_data: Dict[str, Any]) -> int:
+def create_call_record(call_data: Dict[str, Any]) -> str:
     """
     Create a new call record and return its ID.
     This is used by the /api/calls endpoint to persist a call as soon as it is initiated.
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-
+    call_uuid = str(call_data.get("call_id") or uuid4())
     timestamp = call_data.get("timestamp") or datetime.now().isoformat()
 
     contact_data = call_data.get("contact_data")
     if isinstance(contact_data, dict):
-        import json
         contact_data = json.dumps(contact_data)
-    
-    cursor.execute(
-        """
-        INSERT INTO calls (agent_id, phone, contact_name, disposition, duration, notes, timestamp, campaign_mode, contact_data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            call_data.get("agent_id"),
-            call_data.get("phone"),
-            call_data.get("contact_name", ""),
-            call_data.get("disposition", "Pending"),
-            int(call_data.get("duration") or 0),
-            call_data.get("notes", ""),
-            timestamp,
-            call_data.get("campaign_mode", "General"),
-            contact_data,
-        ),
-    )
 
-    call_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return call_id
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO calls (call_id, agent_id, phone, contact_name, disposition, duration, notes, timestamp, campaign_mode, contact_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                call_uuid,
+                call_data.get("agent_id"),
+                call_data.get("phone"),
+                call_data.get("contact_name", ""),
+                call_data.get("disposition", "Pending"),
+                int(call_data.get("duration") or 0),
+                call_data.get("notes", ""),
+                timestamp,
+                call_data.get("campaign_mode", "General"),
+                contact_data,
+            ),
+        )
+    return call_uuid
 
 
 def get_agent_stats(agent_id: str) -> Dict[str, Any]:
@@ -369,55 +369,47 @@ def get_agent_stats(agent_id: str) -> Dict[str, Any]:
     Uses string pattern matching (LIKE) to ensure strict adherence 
     to the current calendar day and month.
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    # Get current date prefixes for robust string matching
-    # Example: '2026-01-07' and '2026-01'
-    now = datetime.now()
-    day_prefix = now.strftime("%Y-%m-%d")
-    month_prefix = now.strftime("%Y-%m")
-    
-    stats: Dict[str, Any] = {
-        "calls_today": 0,
-        "calls_month": 0,
-        "dispositions_today": {},
-    }
-    
-    # 1. Calls Today 
-    # Logic: Count any row where timestamp starts with "YYYY-MM-DD"
-    cursor.execute(
-        "SELECT COUNT(*) FROM calls WHERE agent_id = ? AND timestamp LIKE ?",
-        (agent_id, f"{day_prefix}%"),
-    )
-    row = cursor.fetchone()
-    stats["calls_today"] = row[0] if row else 0
-    
-    # 2. Calls This Month
-    # Logic: Count any row where timestamp starts with "YYYY-MM"
-    cursor.execute(
-        "SELECT COUNT(*) FROM calls WHERE agent_id = ? AND timestamp LIKE ?",
-        (agent_id, f"{month_prefix}%"),
-    )
-    row = cursor.fetchone()
-    stats["calls_month"] = row[0] if row else 0
-    
-    # 3. Disposition breakdown (Today only)
-    cursor.execute(
-        """
-        SELECT disposition, COUNT(*)
-        FROM calls
-        WHERE agent_id = ? AND timestamp LIKE ?
-        GROUP BY disposition
-        """,
-        (agent_id, f"{day_prefix}%"),
-    )
-    
-    for dispo, count in cursor.fetchall():
-        stats["dispositions_today"][dispo] = count
-    
-    conn.close()
-    return stats
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        
+        now = datetime.now()
+        day_prefix = now.strftime("%Y-%m-%d")
+        month_prefix = now.strftime("%Y-%m")
+        
+        stats: Dict[str, Any] = {
+            "calls_today": 0,
+            "calls_month": 0,
+            "dispositions_today": {},
+        }
+        
+        cursor.execute(
+            "SELECT COUNT(*) FROM calls WHERE agent_id = ? AND timestamp LIKE ?",
+            (agent_id, f"{day_prefix}%"),
+        )
+        row = cursor.fetchone()
+        stats["calls_today"] = row[0] if row else 0
+        
+        cursor.execute(
+            "SELECT COUNT(*) FROM calls WHERE agent_id = ? AND timestamp LIKE ?",
+            (agent_id, f"{month_prefix}%"),
+        )
+        row = cursor.fetchone()
+        stats["calls_month"] = row[0] if row else 0
+        
+        cursor.execute(
+            """
+            SELECT disposition, COUNT(*)
+            FROM calls
+            WHERE agent_id = ? AND timestamp LIKE ?
+            GROUP BY disposition
+            """,
+            (agent_id, f"{day_prefix}%"),
+        )
+        
+        for dispo, count in cursor.fetchall():
+            stats["dispositions_today"][dispo] = count
+        
+        return stats
 
 
 def get_all_unique_agents() -> List[str]:
@@ -425,15 +417,11 @@ def get_all_unique_agents() -> List[str]:
     Returns a list of distinct agent_id values from the calls table.
     Returns an empty list if no agents are found.
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT DISTINCT agent_id FROM calls ORDER BY agent_id")
-    rows = cursor.fetchall()
-    
-    conn.close()
-    # Extract agent_id from tuples
-    return [row[0] for row in rows]
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT agent_id FROM calls ORDER BY agent_id")
+        rows = cursor.fetchall()
+        return [row[0] for row in rows]
 
 
 # CSV export column order to match Excel (First Name, Last Name, Title, Company Name, Email 1, Contact Phones, State, Country, Industry, Revenue, Notes, Disposition, etc.)
@@ -536,7 +524,12 @@ def _row_to_export_columns(
     return (row_vals, match_index)
 
 
-def export_dispositions_to_csv(disposition_filter: str | None = None, agent_id: str | None = None) -> io.StringIO:
+def export_dispositions_to_csv(
+    disposition_filter: str | None = None,
+    agent_id: str | None = None,
+    start_ts: str | None = None,
+    end_ts: str | None = None,
+) -> io.StringIO:
     """
     Generates a CSV string of calls with full contact columns from contact_data.
     - If disposition_filter is 'ALL' or None: returns all rows that HAVE a disposition,
@@ -544,59 +537,70 @@ def export_dispositions_to_csv(disposition_filter: str | None = None, agent_id: 
     - If disposition_filter is a specific disposition: returns all matching rows.
     - Only includes rows with contact_data (no-contact-info rows excluded).
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    if disposition_filter and disposition_filter != "ALL":
-        query = """SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data
-                   FROM calls"""
-        params: List[Any] = []
-        conditions = [
-            "disposition = ?",
-            "contact_data IS NOT NULL",
-            "contact_data != ''",
-        ]
-        params.append(disposition_filter)
-        if agent_id and agent_id != "ALL":
-            conditions.append("agent_id = ?")
-            params.append(agent_id)
-        query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY timestamp DESC"
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-    else:
-        base_conditions = [
-            "disposition IS NOT NULL",
-            "disposition != ''",
-            "disposition != 'No Disposition'",
-            "contact_data IS NOT NULL",
-            "contact_data != ''",
-        ]
-        params = []
-        if agent_id and agent_id != "ALL":
-            base_conditions.append("agent_id = ?")
-            params.append(agent_id)
-        where_clause = " AND ".join(base_conditions)
-        # Dedupe by same contact (name + email) per agent, keep latest by timestamp
-        partition_by_contact = (
-            "agent_id, (COALESCE(TRIM(json_extract(contact_data, '$.First Name')), '') || '|' || "
-            "COALESCE(TRIM(json_extract(contact_data, '$.Last Name')), '') || '|' || "
-            "COALESCE(json_extract(contact_data, '$.Emails[0]'), ''))"
-        )
-        query = f"""
-            WITH ranked AS (
-                SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data,
-                       ROW_NUMBER() OVER (PARTITION BY {partition_by_contact} ORDER BY timestamp DESC) AS rn
-                FROM calls
-                WHERE {where_clause}
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        
+        if disposition_filter and disposition_filter != "ALL":
+            query = """SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data
+                       FROM calls"""
+            params: List[Any] = []
+            conditions = [
+                "disposition = ?",
+                "contact_data IS NOT NULL",
+                "contact_data != ''",
+            ]
+            params.append(disposition_filter)
+            if agent_id and agent_id != "ALL":
+                conditions.append("agent_id = ?")
+                params.append(agent_id)
+            if start_ts:
+                conditions.append("timestamp >= ?")
+                params.append(start_ts)
+            if end_ts:
+                conditions.append("timestamp <= ?")
+                params.append(end_ts)
+            query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY timestamp DESC"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+        else:
+            base_conditions = [
+                "disposition IS NOT NULL",
+                "disposition != ''",
+                "disposition != 'No Disposition'",
+                "contact_data IS NOT NULL",
+                "contact_data != ''",
+            ]
+            params = []
+            if agent_id and agent_id != "ALL":
+                base_conditions.append("agent_id = ?")
+                params.append(agent_id)
+            if start_ts:
+                base_conditions.append("timestamp >= ?")
+                params.append(start_ts)
+            if end_ts:
+                base_conditions.append("timestamp <= ?")
+                params.append(end_ts)
+            where_clause = " AND ".join(base_conditions)
+            partition_by_contact = (
+                "agent_id, (COALESCE(TRIM(json_extract(contact_data, '$.First Name')), '') || '|' || "
+                "COALESCE(TRIM(json_extract(contact_data, '$.Last Name')), '') || '|' || "
+                "COALESCE(json_extract(contact_data, '$.Emails[0]'), ''))"
             )
-            SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data
-            FROM ranked
-            WHERE rn = 1
-            ORDER BY timestamp DESC
-        """
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+            query = f"""
+                WITH ranked AS (
+                    SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data,
+                           ROW_NUMBER() OVER (PARTITION BY {partition_by_contact} ORDER BY timestamp DESC) AS rn
+                    FROM calls
+                    WHERE {where_clause}
+                )
+                SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY timestamp DESC
+            """
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
     
     output = io.StringIO()
     writer = csv.writer(output)
@@ -609,7 +613,6 @@ def export_dispositions_to_csv(disposition_filter: str | None = None, agent_id: 
         )
         writer.writerow(out_row)
     
-    conn.close()
     output.seek(0)
     return output
 
@@ -619,7 +622,10 @@ PHONE_COL_START_IDX = 6
 
 
 def export_dispositions_to_xlsx(
-    disposition_filter: str | None = None, agent_id: str | None = None
+    disposition_filter: str | None = None,
+    agent_id: str | None = None,
+    start_ts: str | None = None,
+    end_ts: str | None = None,
 ) -> io.BytesIO:
     """
     Same as export_dispositions_to_csv but returns an xlsx file with the phone cell
@@ -628,57 +634,69 @@ def export_dispositions_to_xlsx(
     from openpyxl import Workbook
     from openpyxl.styles import Font
 
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    if disposition_filter and disposition_filter != "ALL":
-        query = """SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data
-                   FROM calls"""
-        params: List[Any] = []
-        conditions = [
-            "disposition = ?",
-            "contact_data IS NOT NULL",
-            "contact_data != ''",
-        ]
-        params.append(disposition_filter)
-        if agent_id and agent_id != "ALL":
-            conditions.append("agent_id = ?")
-            params.append(agent_id)
-        query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY timestamp DESC"
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-    else:
-        base_conditions = [
-            "disposition IS NOT NULL",
-            "disposition != ''",
-            "disposition != 'No Disposition'",
-            "contact_data IS NOT NULL",
-            "contact_data != ''",
-        ]
-        params = []
-        if agent_id and agent_id != "ALL":
-            base_conditions.append("agent_id = ?")
-            params.append(agent_id)
-        where_clause = " AND ".join(base_conditions)
-        partition_by_contact = (
-            "agent_id, (COALESCE(TRIM(json_extract(contact_data, '$.First Name')), '') || '|' || "
-            "COALESCE(TRIM(json_extract(contact_data, '$.Last Name')), '') || '|' || "
-            "COALESCE(json_extract(contact_data, '$.Emails[0]'), ''))"
-        )
-        query = f"""
-            WITH ranked AS (
-                SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data,
-                       ROW_NUMBER() OVER (PARTITION BY {partition_by_contact} ORDER BY timestamp DESC) AS rn
-                FROM calls
-                WHERE {where_clause}
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        if disposition_filter and disposition_filter != "ALL":
+            query = """SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data
+                       FROM calls"""
+            params: List[Any] = []
+            conditions = [
+                "disposition = ?",
+                "contact_data IS NOT NULL",
+                "contact_data != ''",
+            ]
+            params.append(disposition_filter)
+            if agent_id and agent_id != "ALL":
+                conditions.append("agent_id = ?")
+                params.append(agent_id)
+            if start_ts:
+                conditions.append("timestamp >= ?")
+                params.append(start_ts)
+            if end_ts:
+                conditions.append("timestamp <= ?")
+                params.append(end_ts)
+            query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY timestamp DESC"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+        else:
+            base_conditions = [
+                "disposition IS NOT NULL",
+                "disposition != ''",
+                "disposition != 'No Disposition'",
+                "contact_data IS NOT NULL",
+                "contact_data != ''",
+            ]
+            params = []
+            if agent_id and agent_id != "ALL":
+                base_conditions.append("agent_id = ?")
+                params.append(agent_id)
+            if start_ts:
+                base_conditions.append("timestamp >= ?")
+                params.append(start_ts)
+            if end_ts:
+                base_conditions.append("timestamp <= ?")
+                params.append(end_ts)
+            where_clause = " AND ".join(base_conditions)
+            partition_by_contact = (
+                "agent_id, (COALESCE(TRIM(json_extract(contact_data, '$.First Name')), '') || '|' || "
+                "COALESCE(TRIM(json_extract(contact_data, '$.Last Name')), '') || '|' || "
+                "COALESCE(json_extract(contact_data, '$.Emails[0]'), ''))"
             )
-            SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data
-            FROM ranked
-            WHERE rn = 1
-            ORDER BY timestamp DESC
-        """
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+            query = f"""
+                WITH ranked AS (
+                    SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data,
+                           ROW_NUMBER() OVER (PARTITION BY {partition_by_contact} ORDER BY timestamp DESC) AS rn
+                    FROM calls
+                    WHERE {where_clause}
+                )
+                SELECT agent_id, contact_name, phone, disposition, notes, timestamp, duration, contact_data
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY timestamp DESC
+            """
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
 
     wb = Workbook()
     ws = wb.active
@@ -696,8 +714,6 @@ def export_dispositions_to_xlsx(
             cell = ws.cell(row=excel_row, column=col_idx, value=val)
             if match_index is not None and col_idx == PHONE_COL_START_IDX + 1 + match_index:
                 cell.font = Font(bold=True)
-    conn.close()
-
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
@@ -722,19 +738,14 @@ def create_callback(agent_id: str, scheduled_time: str, notes: str = None,
     Returns:
         The ID of the newly created callback
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO callbacks (agent_id, scheduled_time, notes, status, 
-                              source_workbook_path, source_sheet_name, source_row_index, contact_data)
-        VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?)
-    """, (agent_id, scheduled_time, notes, source_workbook_path, source_sheet_name, source_row_index, contact_data))
-    
-    callback_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return callback_id
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO callbacks (agent_id, scheduled_time, notes, status, 
+                                  source_workbook_path, source_sheet_name, source_row_index, contact_data)
+            VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?)
+        """, (agent_id, scheduled_time, notes, source_workbook_path, source_sheet_name, source_row_index, contact_data))
+        return cursor.lastrowid
 
 
 def update_callback_time(callback_id: int, new_scheduled_time: str):
@@ -745,17 +756,13 @@ def update_callback_time(callback_id: int, new_scheduled_time: str):
         callback_id: Callback ID to update
         new_scheduled_time: New scheduled time in ISO 8601 format
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        UPDATE callbacks 
-        SET scheduled_time = ?
-        WHERE id = ?
-    """, (new_scheduled_time, callback_id))
-    
-    conn.commit()
-    conn.close()
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE callbacks 
+            SET scheduled_time = ?
+            WHERE id = ?
+        """, (new_scheduled_time, callback_id))
 
 
 def complete_callback(callback_id: int):
@@ -765,17 +772,13 @@ def complete_callback(callback_id: int):
     Args:
         callback_id: Callback ID to complete
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        UPDATE callbacks 
-        SET status = 'COMPLETED'
-        WHERE id = ?
-    """, (callback_id,))
-    
-    conn.commit()
-    conn.close()
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE callbacks 
+            SET status = 'COMPLETED'
+            WHERE id = ?
+        """, (callback_id,))
 
 
 def cancel_callback(callback_id: int):
@@ -785,17 +788,13 @@ def cancel_callback(callback_id: int):
     Args:
         callback_id: Callback ID to cancel
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        UPDATE callbacks 
-        SET status = 'CANCELLED'
-        WHERE id = ?
-    """, (callback_id,))
-    
-    conn.commit()
-    conn.close()
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE callbacks 
+            SET status = 'CANCELLED'
+            WHERE id = ?
+        """, (callback_id,))
 
 
 def get_overdue_callbacks(agent_id: str):
@@ -808,27 +807,18 @@ def get_overdue_callbacks(agent_id: str):
     Returns:
         List of callback records as dictionaries
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    current_time = datetime.now().isoformat()
-    cursor.execute("""
-        SELECT * FROM callbacks
-        WHERE agent_id = ? 
-        AND status = 'PENDING'
-        AND scheduled_time < ?
-        ORDER BY scheduled_time ASC
-    """, (agent_id, current_time))
-    
-    # Get column names from the cursor description
-    column_names = [description[0] for description in cursor.description]
-    rows = cursor.fetchall()
-    
-    # Manually create the list of dictionaries
-    callbacks = [dict(zip(column_names, row)) for row in rows]
-    
-    conn.close()
-    return callbacks
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        current_time = datetime.now().isoformat()
+        cursor.execute("""
+            SELECT * FROM callbacks
+            WHERE agent_id = ? 
+            AND status = 'PENDING'
+            AND scheduled_time < ?
+            ORDER BY scheduled_time ASC
+        """, (agent_id, current_time))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
 
 
 def get_due_callbacks():
@@ -838,31 +828,22 @@ def get_due_callbacks():
     Returns:
         List of callback records as dictionaries
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    from datetime import timedelta
-    now = datetime.now()
-    one_minute_ago = (now - timedelta(minutes=1)).isoformat()
-    now_iso = now.isoformat()
-    
-    cursor.execute("""
-        SELECT * FROM callbacks
-        WHERE status = 'PENDING'
-        AND scheduled_time >= ?
-        AND scheduled_time <= ?
-        ORDER BY scheduled_time ASC
-    """, (one_minute_ago, now_iso))
-    
-    # Get column names from the cursor description
-    column_names = [description[0] for description in cursor.description]
-    rows = cursor.fetchall()
-    
-    # Manually create the list of dictionaries
-    callbacks = [dict(zip(column_names, row)) for row in rows]
-    
-    conn.close()
-    return callbacks
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        from datetime import timedelta
+        now = datetime.now()
+        one_minute_ago = (now - timedelta(minutes=1)).isoformat()
+        now_iso = now.isoformat()
+        
+        cursor.execute("""
+            SELECT * FROM callbacks
+            WHERE status = 'PENDING'
+            AND scheduled_time >= ?
+            AND scheduled_time <= ?
+            ORDER BY scheduled_time ASC
+        """, (one_minute_ago, now_iso))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
 
 
 def get_callback(callback_id: int):
@@ -875,24 +856,15 @@ def get_callback(callback_id: int):
     Returns:
         Callback record as dictionary, or None if not found
     """
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT * FROM callbacks WHERE id = ?
-    """, (callback_id,))
-    
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
-        return None
-    
-    # Get column names and create the dictionary
-    column_names = [description[0] for description in cursor.description]
-    callback = dict(zip(column_names, row))
-    
-    conn.close()
-    return callback
+    with get_connection(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM callbacks WHERE id = ?
+        """, (callback_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return dict(row)
 
 
 # Initialize database on module import
